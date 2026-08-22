@@ -1,0 +1,1898 @@
+ETUDE DE FAISABILITE - BOTS INTERNES (JOUEURS SANS CONNEXION RESEAU)
+Depot: quantum-core-x - Analyse en lecture seule
+Date: 2026-08-20
+
+
+1. SYNTHESE EXECUTIVE
+================================================================================
+
+[VERIFIE] SCENARIO A CONFIRME : le decouplage existe deja et fonctionne.
+
+La classe joueur (PlayerEntity) ne depend que d'une INTERFACE de connexion
+(IGameConnection : IConnection), jamais d'un socket concret. Le point d'envoi
+de paquets est unique dans son contrat : IConnection.Send<T>(T packet)
+(src/CorePluginAPI/IConnection.cs:12). Tous les ~68 sites d'envoi du serveur
+de jeu passent par cette seule methode d'interface.
+
+Preuve la plus forte : la suite de tests du depot cree DEJA un PlayerEntity
+pleinement fonctionnel (spawn dans le monde, tick, mise a jour) avec un faux
+IGameConnection genere par NSubstitute (aucun TcpClient, aucun socket) :
+src/Tests/Game.Tests/WorldTests.cs:141-150. C'est exactement le patron
+cmangos "disconnected/bot" decrit dans la demande, deja exerce par le code,
+mais seulement pour des tests, pas pour un usage en production.
+
+Le seul point de couplage fort au reseau est la classe concrete GameConnection
+(src/Libraries/Game.Server/GameConnection.cs), qui herite de Connection
+(src/Core/Core/Networking/Connection.cs), elle-meme un BackgroundService
+attache a un TcpClient. Mais rien n'oblige a utiliser cette classe : un bot
+n'a pas besoin d'heriter de Connection, il lui suffit d'implementer
+IGameConnection directement (interface pure, 6 membres).
+
+Effort de decouplage estime : FAIBLE A MOYEN.
+- Le decouplage lui-meme (le sujet de l'etude) est deja fait par construction
+  de l'architecture existante -> effort quasi nul pour "faire exister" un bot.
+- L'effort reel se situe ailleurs : (a) fournir des donnees PlayerData/compte
+  valides sans casser la persistance EF Core au despawn (risque identifie,
+  section 11), (b) adapter le comportement (IBehaviour) car le systeme d'IA
+  existant (SimpleBehaviour) est ecrit pour MonsterEntity et pas reutilisable
+  tel quel sur un IPlayerEntity, (c) integrer proprement la creation/gestion
+  du cycle de vie du bot dans PlayerFactory/World/GameServer.
+
+Chemin le plus court : creer une classe NullGameConnection : IGameConnection,
+une PlayerData en memoire, appeler PlayerFactory.CreatePlayerAsync, puis
+IWorld.SpawnEntity. Detail section 10.
+
+
+2. CARTOGRAPHIE DU DEPOT
+================================================================================
+
+[VERIFIE] Solution .NET multi-projets (racine des sources : src/).
+
+Executables (points d'entree, un par processus) :
+- src/Executables/Auth/Program.cs : serveur d'authentification.
+- src/Executables/Game/Program.cs : serveur de jeu (celui qui nous interesse).
+  Construit le host via QuantumCoreHostBuilder.CreateHostAsync, enregistre
+  GameServer comme IHostedService + IGameServer + IServerBase
+  (src/Executables/Game/Program.cs:12-20), migre la base de donnees EF Core
+  (GameDbContext.Database.MigrateAsync(), ligne 34) puis lance le host.
+- src/Executables/Single/Program.cs : variante "tout-en-un" (auth+jeu ensemble,
+  non inspectee en detail, hors perimetre prioritaire).
+- src/Executables/DocsGenerator : generateur de documentation, hors sujet.
+
+Bibliotheques principales :
+- src/Core, src/CorePluginAPI : socle bas niveau (Connection abstraite,
+  ServerBase<T>, hebergement, chargement de plugins). CorePluginAPI ne
+  contient QUE des interfaces/DTO/enums (aucune implementation concrete),
+  c'est le contrat public consomme par les plugins et par Game.Server.
+- src/Core.Networking, src/Core.Networking.Generators : format de paquets
+  binaires custom (IPacketSerializable, PacketAttribute) avec generateur de
+  code Roslyn (source generator) pour la (de)serialisation
+  (src/Core.Networking.Generators/PacketSerializerGenerator.cs). Pas de
+  bibliotheque reseau tierce : sockets bruts .NET (System.Net.Sockets.TcpClient
+  / NetworkStream), pas de Kestrel/DotNetty/etc.
+  [VERIFIE] src/Core/Core/Networking/Connection.cs:1-4.
+- src/Libraries/Game.Server : coeur logique du serveur de jeu (monde, entites,
+  joueurs, monstres, commandes, quetes, guildes...). C'est le projet central
+  de l'etude.
+- src/Libraries/Game.Commands : infrastructure generique de commandes
+  (CommandLine-based), utilisee par les commandes GM/admin.
+- src/Libraries/Auth.Server : serveur d'authentification.
+- src/Data/* : couches de persistance -- Game.Persistence (EF Core, voir
+  GameDbContext, migrations ; src/Executables/Game/Program.cs:2 et :31),
+  Game.Caching (Redis, via ICacheManager), et equivalents Auth.*.
+- src/Plugins/* : exemples de plugins (ExamplePlugin, PrometheusPlugin) --
+  le systeme de plugin repose sur Weikio.PluginFramework
+  (using Weikio.PluginFramework.Catalogs vu dans les tests) + DI Microsoft.
+- src/Tests/* : tests xUnit, avec NSubstitute pour le mocking (confirme les
+  patterns de decouplage, voir section 4).
+- src/Game.Benchmarks : benchmarks BenchmarkDotNet (inclut un
+  WorldUpdateBenchmark.cs qui touche a "mount" par coincidence de nommage
+  seulement -- pas un vrai systeme de monture, voir section 9).
+
+Technologies : .NET moderne (types recents type ImmutableArray, primary
+patterns C# 12/13), Microsoft.Extensions.Hosting (Generic Host) comme socle
+d'application, Microsoft.Extensions.DependencyInjection comme conteneur DI
+(pas d'Autofac ni de conteneur tiers observe), Entity Framework Core comme
+ORM (src/Executables/Game/Program.cs:2,31), Redis comme cache/pubsub
+(ICacheManager, IRedisSubscriber dans CorePluginAPI), NSubstitute + xUnit
+pour les tests.
+
+
+3. CYCLE DE VIE DU JOUEUR
+================================================================================
+
+[VERIFIE] Chaine "connexion TCP -> personnage en jeu" :
+
+1. ServerBase<T>.OnClientAccepted accepte une TcpClient et cree l'instance de
+   connexion concrete via DI : `ActivatorUtilities.CreateInstance<T>(scope,
+   client, this)` (src/Core/Core/Networking/ServerBase.cs:88), avec T=
+   GameConnection pour le serveur de jeu. C'est le SEUL endroit ou une
+   GameConnection reelle est instanciee dans ce flux ; elle exige un
+   TcpClient au constructeur (src/Libraries/Game.Server/GameConnection.cs:25-36)
+   et appelle Init(client) qui demarre la boucle d'envoi asynchrone
+   (src/Core/Core/Networking/Connection.cs:47-54).
+2. Handshake, puis authentification (paquets Auth), puis selection de
+   personnage : SelectGameCharacterHandler
+   (src/Libraries/Game.Server/PacketHandlers/Select/SelectGameCharacterHandler.cs)
+   charge un PlayerData via IPlayerManager.GetPlayerAsync, puis appelle
+   `IPlayerFactory.CreatePlayerAsync(ctx.Connection, player)` (ligne 47).
+3. IPlayerFactory.CreatePlayerAsync (interface,
+   src/Libraries/Game.Server/IPlayerFactory.cs:12) est implementee par
+   PlayerFactory (src/Libraries/Game.Server/PlayerFactory.cs:21-27) :
+   `ActivatorUtilities.CreateInstance<PlayerEntity>(_provider, [connection,
+   player])` puis `await entity.LoadAsync()`. C'est la factory/singleton de
+   creation demandee dans les axes d'investigation.
+4. EnterGameHandler (src/Libraries/Game.Server/PacketHandlers/Loading/
+   EnterGameHandler.cs:45-46) appelle `player.ShowEntity(ctx.Connection)` puis
+   `_world.SpawnEntity(player)` : c'est l'insertion effective dans le monde
+   simule (grille/quadtree, voir section 5).
+
+[VERIFIE] Constructeur de PlayerEntity
+(src/Libraries/Game.Server/World/Entities/PlayerEntity.cs:105-141) :
+```
+public PlayerEntity(PlayerData player, IGameConnection connection,
+    IItemManager itemManager, IJobManager jobManager,
+    IExperienceManager experienceManager, IAnimationManager animationManager,
+    IQuestManager questManager, ICacheManager cacheManager, IWorld world,
+    ILogger<PlayerEntity> logger, IServiceProvider serviceProvider)
+```
+Toutes les dependances hormis `player` (PlayerData, un DTO simple) et
+`connection` sont des SERVICES ENREGISTRES DANS LE CONTENEUR DI et resolus
+automatiquement par ActivatorUtilities -- un bot n'a donc besoin de fournir
+explicitement QUE PlayerData et une implementation de IGameConnection ; le
+reste est injecte normalement. Seul `player` est verifie non-null au
+constructeur (`ArgumentNullException.ThrowIfNull(player)`, ligne 114) ;
+`connection` n'est PAS verifie (voir section 4).
+
+`LoadAsync()` (lignes 165-183) charge l'inventaire, la quickslot bar, calcule
+MaxHp/MaxSp via IJobManager, charge les permissions, charge la guilde via
+IGuildManager, et initialise les quetes via IQuestManager.InitializePlayer.
+Toutes ces dependances viennent de services DI, aucune n'exige la connexion
+reseau elle-meme -- seule IGameConnection.Server (IServerBase, interface) est
+utilisee plus tard pour l'horodatage (`Connection.Server.Clock.Elapsed`,
+ligne 1032, dans CalculatePlayedTimeAsync).
+
+Il n'existe qu'une seule factory/methode de creation observee
+(IPlayerFactory/PlayerFactory). Aucune autre voie de creation de PlayerEntity
+en production n'a ete trouvee, hormis l'appel direct par
+ActivatorUtilities.CreateInstance dans les tests
+(src/Tests/Game.Tests/WorldTests.cs:148), qui contourne LoadAsync().
+
+
+4. COUPLAGE A LA CONNEXION -- POINT CENTRAL
+================================================================================
+
+[VERIFIE] Type de la reference detenue par le joueur :
+`public IGameConnection Connection { get; }` --
+src/Libraries/Game.Server/World/Entities/PlayerEntity.cs:33.
+
+[VERIFIE] IGameConnection est une INTERFACE, pas une classe concrete :
+src/CorePluginAPI/IGameConnection.cs:7-15 :
+```
+public interface IGameConnection : IConnection
+{
+    IServerBase Server { get; }
+    IPAddress BoundIpAddress { get; }
+    Guid? AccountId { get; set; }
+    string Username { get; set; }
+    IPlayerEntity? Player { get; set; }
+    bool HandleHandshake(GcHandshakeData handshake);
+}
+```
+Elle herite de IConnection, elle-meme une interface pure
+(src/CorePluginAPI/IConnection.cs:6-14) :
+```
+public interface IConnection
+{
+    Guid Id { get; }
+    EPhase Phase { get; set; }
+    Task? ExecuteTask { get; }
+    void Close(bool expected = true);
+    void Send<T>(T packet) where T : IPacketSerializable;
+    Task StartAsync(CancellationToken token = default);
+}
+```
+Aucun membre n'expose de type concret lie a un socket (pas de TcpClient, pas
+de Stream). L'ensemble de la surface est implementable par une classe legere
+qui n'a rien a voir avec le reseau. `Task? ExecuteTask` est nullable, ce qui
+permet a une fausse connexion de n'avoir aucune tache d'execution associee.
+
+[VERIFIE] La classe concrete de production, GameConnection, EST couplee a un
+socket : elle herite de Connection (abstraite), elle-meme BackgroundService
+lie a TcpClient/NetworkStream avec une boucle d'envoi degageant les paquets
+d'une ConcurrentQueue vers le flux reseau
+(src/Core/Core/Networking/Connection.cs:20-54, 134-214). Mais RIEN n'oblige
+un bot a utiliser cette classe : PlayerEntity ne connait que l'interface
+IGameConnection, jamais Connection ni GameConnection.
+
+[VERIFIE] Nullabilite / deref sans verification :
+- Le constructeur de PlayerEntity ne verifie PAS `connection` avec
+  ArgumentNullException.ThrowIfNull (seul `player` l'est, ligne 114). Une
+  connexion null casserait au premier `Connection.Send(...)` avec une
+  NullReferenceException -- mais ce n'est pas un obstacle pour un bot,
+  puisqu'on n'a pas besoin de null : on fournit une implementation "no-op".
+- Le type `IPlayerEntity? Player` sur IGameConnection est nullable et deja
+  traite comme tel partout observe (ex. EnterGameHandler.cs:26-32,
+  CharacterMoveHandler.cs:33-38) : le code existant sait deja gerer une
+  connexion sans joueur associe, ce qui est le sens inverse (utile si on
+  veut, a terme, un bot qui n'a pas de PlayerEntity "reel" a certains
+  moments), mais confirme la robustesse des verifications de nullite autour
+  de IGameConnection.
+
+[VERIFIE] Points d'envoi de paquets :
+Recherche de `.Send(` dans src/Libraries/Game.Server : 68 occurrences dans
+28 fichiers (ChatManager, handlers de paquets, Entity.cs, PlayerEntity.cs,
+MonsterEntity.cs, SimpleBehaviour.cs, Shop.cs, Quest.cs, PlayerSkills.cs,
+QuickSlotBar.cs, etc.). Ils sont DISPERSES dans la base (pas d'un seul point
+d'appel), MAIS ils convergent tous vers UNE SEULE methode d'interface :
+`IConnection.Send<T>(T packet)`. Il n'y a donc qu'UN SEUL POINT DE CONTRAT A
+IMPLEMENTER, meme si les appelants sont nombreux. C'est la caracteristique clef
+qui rend l'approche "connexion nulle absorbant les envois" viable a moindre
+effort : une seule methode a rendre no-op.
+
+Note complementaire : de nombreux appels a `.Send(...)` observes se font sur
+`Connection.Send(...)` d'AUTRES joueurs (ex. `player.Connection.Send(packet)`
+dans Entity.cs:308, 336, 383/434/439, SimpleBehaviour.cs:383,
+CharacterMoveHandler.cs:92) -- c'est-a-dire qu'un bot recevra potentiellement
+des paquets envoyes par le code quand il est dans la liste NearbyEntities
+d'un vrai joueur ou l'inverse. Si le bot est le RECEVEUR (des vrais joueurs
+lui envoient des paquets via son IGameConnection.Send), il faut absolument
+que cette methode soit un no-op silencieux -- sinon exception.
+Si le bot est l'EMETTEUR (bot.Connection.Send(...) est appele par du code qui
+suppose que Connection est le joueur courant, ex. Entity.Die() ligne 340,
+Respawn() ligne 383/387), le meme no-op suffit.
+
+[VERIFIE] Verdict : on PEUT injecter une implementation "nulle" absorbant les
+envois, et c'est deja fait pour les tests. Le point precis d'injection est le
+parametre `connection` du constructeur de PlayerEntity / de
+IPlayerFactory.CreatePlayerAsync(IGameConnection connection, PlayerData player)
+(src/Libraries/Game.Server/IPlayerFactory.cs:12). Preuve d'usage reel dans le
+code du depot lui-meme :
+src/Tests/Game.Tests/WorldTests.cs:141-150 :
+```
+var conn = Substitute.For<IGameConnection>();
+conn.BoundIpAddress.Returns(IPAddress.Loopback);
+conn.Server.Returns(_gameServer);
+var playerData = new PlayerData { Name = "TestPlayer", ... };
+_playerEntity = ActivatorUtilities.CreateInstance<PlayerEntity>(_services,
+    _world, playerData, conn);
+_world.SpawnEntity(_playerEntity);
+_world.Update(Tick(0.2)); // spawn all entities
+```
+Ce test cree un PlayerEntity complet, le spawn dans le World reel, et le fait
+avancer dans la boucle de tick reelle -- sans aucun TcpClient. C'est
+exactement le scenario demande dans le prompt (reference cmangos), deja
+demontre fonctionnel dans ce depot, mais uniquement en contexte de test
+unitaire, pas comme fonctionnalite de production exposee.
+
+Limite identifiee (secondaire) : la connexion factice n'est PAS enregistree
+dans `IGameServer.Connections` (ImmutableArray<IGameConnection>,
+src/CorePluginAPI/IGameServer.cs:7), lequel n'est peuple que par
+ServerBase<T>.OnClientAccepted (src/Core/Core/Networking/ServerBase.cs:88-89)
+lors d'une vraie acceptation TCP. Or certains broadcasts globaux (chat)
+passent par `gameServer.ForAllConnections(...)` qui itere
+`gameServer.Connections`
+(src/Libraries/Game.Server/Extensions/ConnectionExtensions.cs:7-14, utilise
+dans ChatManager.cs:62,106,131). Consequence : un bot cree hors du flux TCP
+n'apparaitra PAS dans cette liste et ne recevra donc pas les messages
+diffuses par ce mecanisme precis -- sans impact pour l'objectif "faire
+exister le bot", mais a garder en tete si un jour on veut que le bot recoive
+des evenements globaux du serveur.
+
+
+5. INSERTION DANS LE MONDE
+================================================================================
+
+[VERIFIE] Mecanisme COMMUN aux joueurs et aux monstres. `IWorld.SpawnEntity(
+IEntity e)` (implemente dans World.cs:286-316) prend n'importe quel IEntity :
+si c'est un IPlayerEntity, il l'ajoute au dictionnaire `_players` (AddPlayer,
+ligne 305), puis dans tous les cas appelle `map.SpawnEntity(e)`
+(Map.cs, methode publique non listee en detail ici mais qui enfile l'entite
+dans `_pendingSpawns`, consommee par Map.Update, voir section 6).
+
+[VERIFIE] Grille/index spatial : la carte (`Map`, classe concrete implementant
+IMap) possede un QuadTree (`_quadTree`, src/Libraries/Game.Server/World/
+Map.cs:41) commun a toutes les entites (joueurs, monstres, pierres metin,
+objets au sol -- tous des IEntity). L'insertion se fait dans Map.Update() :
+`_quadTree.Insert(entity)` (Map.cs:127), puis une requete de voisinage
+`_quadTree.QueryAround(nearby, entity.PositionX, entity.PositionY,
+Entity.VIEW_DISTANCE, filter)` (Map.cs:138) etablit les listes
+NearbyEntities dans les deux sens (`entity.AddNearbyEntity(e)` /
+`e.AddNearbyEntity(entity)`, Map.cs:142-143).
+
+[VERIFIE] Visibilite : la portee de vue est une constante
+`Entity.VIEW_DISTANCE = 10000` (src/Libraries/Game.Server/World/Entities/
+Entity.cs:82). Le filtre de pertinence differencie : si l'entite qui bouge
+n'est PAS un joueur, seuls les JOUEURS sont pertinents pour son "nearby"
+(`filter = EEntityType.PLAYER`, Map.cs:131-136 et 187-192) -- optimisation
+pour eviter de calculer les voisins de chaque monstre vis-a-vis d'autres
+monstres. Quand une entite EST un joueur et que sa position a change
+(`PositionChanged`), le code recalcule sa liste completement (Map.cs:184-231)
+et notifie via `OnNewNearbyEntity`/`OnRemoveNearbyEntity`, qui pour
+PlayerEntity declenchent `entity.ShowEntity(Connection)` /
+`entity.HideEntity(Connection)` (PlayerEntity.cs:862-872) -- donc au final un
+appel a Connection.Send(...). Un bot dont la connexion est no-op absorbera
+silencieusement ces envois, exactement comme souhaite.
+
+Le mecanisme est donc identique pour un joueur et pour un monstre (meme
+QuadTree, meme classe Map, meme methode SpawnEntity/DespawnEntity) ; la seule
+divergence de traitement est l'enregistrement optionnel dans le dictionnaire
+`_players` de World (utile pour recherche par nom/vid, guildes, etc.).
+
+
+6. BOUCLE DE MISE A JOUR
+================================================================================
+
+[VERIFIE] GameServer (src/Libraries/Game.Server/GameServer.cs) est un
+BackgroundService dont la boucle de tick vise 100Hz : `_targetElapsedTime =
+TimeSpan.FromTicks(100000)` = 10 ms (GameServer.cs:29, commentaire "100hz"
+sur la meme ligne). La methode `Update(TickContext ctx)` (GameServer.cs:50-55)
+appelle `EventSystem.Update(ctx)` puis `_world.Update(ctx)`.
+
+[VERIFIE] World.Update (World.cs:185-193) parcourt toutes les cartes
+chargees et appelle `map.Update(ctx)` pour chacune. Map.Update (Map.cs:121-234)
+traite les spawns/despawns en attente PUIS appelle `entity.Update(ctx)` pour
+CHAQUE entite de la carte (Map.cs:173-175), sans distinction entre joueurs et
+monstres -- c'est le meme pipeline pour les deux.
+
+[VERIFIE] Une entite se branche sur ce tick en surchargeant
+`Entity.Update(TickContext ctx)` (methode virtuelle,
+src/Libraries/Game.Server/World/Entities/Entity.cs:102-121). PlayerEntity la
+surcharge pour la regeneration de vie/mana (PlayerEntity.cs:520-568),
+MonsterEntity la surcharge pour la mort differee et pour piloter son
+IBehaviour (`_behaviour?.Init/Update`, MonsterEntity.cs:102 et suite). Un bot
+(qu'il soit une PlayerEntity standard ou une sous-classe) recevrait donc
+NATURELLEMENT un appel a 100 Hz des lors qu'il est spawn dans une Map, sans
+mecanisme special a batir : c'est deja le comportement de toute IEntity
+inseree via IWorld.SpawnEntity.
+
+Il n'existe pas de "timer independant par entite" observe (pas de
+Timer/Task.Delay individuel par joueur/monstre pour son IA) : tout passe par
+ce tick global synchrone a 100Hz. Un comportement de bot (deplacement, farm,
+etc.) doit donc etre concu comme une machine a etats pilotee depuis
+Update(ctx), a l'image de MonsterEntity + IBehaviour, et non comme une tache
+asynchrone independante.
+
+
+7. DEPLACEMENT ET DIFFUSION
+================================================================================
+
+[VERIFIE] Le chemin normal partant d'un paquet client est
+CharacterMoveHandler (src/Libraries/Game.Server/PacketHandlers/Game/
+CharacterMoveHandler.cs) : il valide le type de mouvement, verifie que
+`ctx.Connection.Player` n'est pas null (lignes 33-38), puis pour un
+deplacement standard appelle directement
+`ctx.Connection.Player.Goto(ctx.Packet.PositionX, ctx.Packet.PositionY,
+ctx.Connection.Server.Clock.Now)` (ligne 44) -- une METHODE PUBLIQUE ordinaire
+de l'entite, PAS une methode privee au paquet. Puis il construit un paquet
+CharacterMoveOut et le diffuse manuellement a chaque IPlayerEntity de
+`ctx.Connection.Player.NearbyEntities` (lignes 88-94) via
+`player.Connection.Send(movement)`.
+
+[VERIFIE] Point d'entree interne existant : `Entity.Goto(int x, int y,
+ServerTimestamp startAt)` (Entity.cs:135-175) et `Entity.Move(int x, int y)`
+(Entity.cs:123-130, surchargee dans PlayerEntity.cs:239-264) sont des methodes
+publiques de l'entite, appelables depuis N'IMPORTE QUEL code serveur, sans
+paquet. La preuve la plus directe est SimpleBehaviour (systeme d'IA des
+monstres) qui appelle `_entity.Goto(...)` directement en boucle
+(World/AI/SimpleBehaviour.cs:252,271 notamment) pour deplacer une entite par
+code pur, sans jamais passer par un paquet reseau. Un bot peut donc etre
+deplace exactement de la meme maniere.
+
+[VERIFIE] En revanche, la DIFFUSION du mouvement aux joueurs proches
+(construction et envoi du paquet CharacterMoveOut) N'EST PAS centralisee dans
+Entity/PlayerEntity elle-meme pour le cas "mouvement standard" -- c'est fait
+manuellement dans le handler de paquet (CharacterMoveHandler.cs:74-94), donc
+si un bot est deplace par du code interne (ex. un IBehaviour) sans passer par
+ce handler, il faudra reproduire cette diffusion soi-meme (ou factoriser ce
+bloc), sauf pour les monstres ou SimpleBehaviour.Update le fait deja pour les
+attaques (SimpleBehaviour.cs:369-385) en construisant et envoyant lui-meme un
+CharacterMoveOut aux joueurs proches. Il n'y a pas d'equivalent generique
+"BroadcastMovement(entity)" reutilise par les deux chemins (packet-handler et
+IA de monstre) -- chacun refait sa propre construction/diffusion du paquet.
+C'est une duplication existante, pas une limite bloquante pour un bot, mais
+un point a factoriser si on veut un bot "propre".
+
+
+8. EXISTANT REUTILISABLE
+================================================================================
+
+[VERIFIE] Systeme d'IA pour les monstres :
+- Interface IBehaviour (src/CorePluginAPI/Game/World/AI/IBehaviour.cs) avec
+  `Init(IEntity entity)` et `Update(TickContext ctx)`.
+- SimpleBehaviour (src/Libraries/Game.Server/World/AI/SimpleBehaviour.cs) :
+  agressivite (`IsAggressive`, ligne 40, activee via `EAiFlags.AGGRESSIVE` du
+  proto monstre, ligne 74), ciblage/aggro avec table de degats
+  (`_damageMap`, TookDamage/NextTarget, lignes 388-442), deplacement
+  aleatoire en idle (MoveToRandomLocation, lignes 85-101), poursuite et
+  positionnement d'attaque avec verification d'obstacles via l'attribut de
+  carte (TryGoto verifie BLOCK/OBJECT et ligne droite, lignes 243-273),
+  gestion de la portee d'attaque et du cooldown (Update, lignes 146-241).
+  C'est une machine a etats assez complete, mais ECRITE POUR IEntity
+  generique cote mouvement (donc reutilisable pour deplacer un bot-joueur),
+  MOTIF PARTIELLEMENT SPECIFIQUE A MonsterEntity cote attaque : `Attack(...)`
+  caste explicitement `_entity is not MonsterEntity monster` et retourne sinon
+  (SimpleBehaviour.cs:359-362), et `ShouldChangeAttackPosition`/`MoveTo`
+  utilisent aussi des checks `is MonsterEntity` (lignes 124, 316). Donc :
+  reutilisable pour le DEPLACEMENT d'un bot, PAS directement reutilisable
+  tel quel pour le COMBAT d'un bot-joueur sans modification (petit
+  refactoring pour generaliser au-dela de MonsterEntity, ou nouvelle classe
+  de comportement dediee aux bots-joueurs en s'inspirant de SimpleBehaviour).
+- StoneBehaviour (src/Libraries/Game.Server/World/AI/StoneBehaviour.cs) :
+  comportement specifique aux pierres Metin, non pertinent pour des bots.
+- Pas de pathfinding au sens "recherche de chemin" (A*, navmesh) observe --
+  uniquement des trajectoires directes avec verification d'obstacle en ligne
+  droite (`IsAttrOnStraightPathTo`, utilise par SimpleBehaviour.cs:266).
+
+[VERIFIE] Outils/commandes qui creent des entites par code (donc sans passer
+par un paquet client) :
+- SpawnCommand (src/Libraries/Game.Server/Commands/SpawnCommand.cs:35-66) :
+  commande GM `/spawn` (alias `/m`, `/mob`) qui instancie directement
+  `new MonsterEntity(...)` puis `_world.SpawnEntity(monster)` -- c'est le
+  PATRON DIRECT a suivre pour une future commande "spawn bot".
+- SpawnExtendedCommand, SpawnMapRandomCommand : variantes non detaillees ici,
+  meme famille.
+- Le test WorldTests (section 4) constitue un deuxieme patron directement
+  transposable pour un joueur (et non un monstre).
+
+Aucun autre outil de debug specifique aux "faux joueurs" n'a ete trouve dans
+le depot (pas de commande "bot", "fakeplayer" ou equivalent).
+
+
+9. POINTS ANNEXES (montures, quetes/dialogues)
+================================================================================
+
+[VERIFIE] Montures / chevaux : AUCUN systeme trouve. Une recherche
+insensible a la casse de "horse"/"mount" dans tout src/*.cs ne remonte QUE des
+faux positifs par sous-chaine (ex. "aMOUNT" dans "Amount", "GetMaxDamage"
+contenant hasard "mo..." non pertinent, noms de fichiers comme
+WorldUpdateBenchmark.cs qui contient le mot "amount" dans son code). Aucune
+classe, enum, ou attribut lie a une monture/cheval n'existe dans le code
+actuel du depot.
+
+[VERIFIE] Quetes : un systeme de quetes existe et est fonctionnel a un
+niveau basique :
+- IQuestManager/QuestManager (src/Libraries/Game.Server/Quest/QuestManager.cs)
+  scanne l'assembly a la recherche de types portant [QuestAttribute] et les
+  enregistre (LoadAsync, lignes 22-36).
+- Quest.cs (classe de base des quetes), InternalQuest.cs, LevelUpQuest.cs,
+  TestQuest.cs : implementations concretes limitees, orientees evenements
+  serveur (ex. montee de niveau) plutot que dialogues riches scriptes.
+- GameEventManager.RegisterNpcClickEvent(name, npcId, callback)
+  (src/Libraries/Game.Server/GameEventManager.cs:101, utilise par
+  World.cs:127-131 pour ouvrir une boutique au clic sur un PNJ marchand) est
+  le seul mecanisme d'interaction PNJ->serveur observe. AUCUNE trace d'un
+  systeme de fenetre de dialogue PNJ scriptable (pas de "NpcDialog", pas de
+  moteur de script de quete façon LUA du jeu original) n'a ete trouvee dans
+  le code C# du depot -- recherche de "NpcDialog"/"Dialog"/"QuestNpc" sans
+  resultat hors tests/faux positifs.
+[HYPOTHESE] Le systeme de quetes est donc davantage un point d'extension
+programmatique (classes C# avec attribut) qu'un vrai moteur de scenario avec
+dialogues -- mais je n'ai pas explore Quest.cs/InternalQuest.cs/
+LevelUpQuest.cs ligne a ligne, cette affirmation reste a confirmer par une
+lecture plus approfondie si le sujet devient prioritaire.
+
+
+10. CHEMIN LE PLUS COURT VERS UN PREMIER BOT VISIBLE
+================================================================================
+
+Description d'etapes, sans code, dans l'ordre :
+
+1. Creer une nouvelle classe (ex. `NullGameConnection`) qui implemente
+   IGameConnection (src/CorePluginAPI/IGameConnection.cs) avec des
+   implementations no-op/triviales : `Send<T>` ne fait rien, `Close` ne fait
+   rien ou marque un etat interne, `StartAsync` retourne Task.CompletedTask,
+   `ExecuteTask` retourne null, `Server` retourne l'IServerBase reel injecte
+   (le GameServer en cours d'execution, deja enregistre en DI -- voir
+   src/Executables/Game/Program.cs:17-20), `Id` un Guid.NewGuid(), `Phase`
+   un simple champ auto-implemente. Fichier de reference pour la forme du
+   contrat : src/CorePluginAPI/IGameConnection.cs et
+   src/CorePluginAPI/IConnection.cs. S'inspirer aussi de
+   src/Tests/Game.Tests/WorldTests.cs:141-150 qui montre les membres
+   effectivement sollicites en pratique (BoundIpAddress, Server).
+
+2. Construire un PlayerData en memoire (src/CorePluginAPI/Core/Models/
+   PlayerData.cs) avec un Name unique, une classe/empire valides, une
+   position de spawn. Decider tot si le bot doit avoir un AccountId reel
+   (necessite une ligne compte en base) ou un AccountId factice -- ce choix
+   impacte directement le risque de persistance (section 11).
+
+3. Appeler IPlayerFactory.CreatePlayerAsync(nullConnection, playerData)
+   (src/Libraries/Game.Server/PlayerFactory.cs:21-27), depuis un point
+   d'amorçage cote serveur (ex. une nouvelle commande GM sur le modele de
+   SpawnCommand, src/Libraries/Game.Server/Commands/SpawnCommand.cs, ou un
+   service demarre au boot du GameServer). Cela declenche LoadAsync()
+   (inventaire, quickslotbar, competences, guilde, quetes) exactement comme
+   pour un vrai joueur.
+
+4. Appeler IWorld.SpawnEntity(entity) (src/Libraries/Game.Server/World/
+   World.cs:286-316) avec l'entite retournee -- c'est la meme methode que
+   pour un monstre ; elle insere le bot dans la Map correspondant a sa
+   position, l'ajoute au dictionnaire de recherche des joueurs, et a partir
+   du prochain tick (jusqu'a 10ms plus tard) le QuadTree de la carte
+   l'indexera et calculera son voisinage (Map.cs:121-148).
+
+5. Verifier que le bot apparait pour un vrai joueur proche : des le premier
+   passage de Map.Update ou le joueur reel et le bot deviennent mutuellement
+   "nearby", `OnNewNearbyEntity` declenche `entity.ShowEntity(Connection)`
+   (PlayerEntity.cs:862-866) sur la connexion du VRAI joueur -- qui, elle,
+   est une vraie GameConnection reseau -- donc le paquet d'apparition du bot
+   part reellement sur le fil vers le client du joueur reel. C'est le
+   "premier bot visible" demande.
+
+6. (Optionnel, etape suivante logique mais hors perimetre de cette etude)
+   brancher un comportement en surchargeant Update(TickContext) sur une
+   sous-classe de PlayerEntity, ou en pilotant Goto/Move depuis un service
+   externe qui itere periodiquement sur les bots enregistres -- en
+   s'inspirant de SimpleBehaviour (section 8) pour la partie deplacement.
+
+
+11. RISQUES ET POINTS DE BLOCAGE PROBABLES
+================================================================================
+
+[VERIFIE] Persistance au despawn : PlayerEntity.OnDespawnAsync appelle
+PersistAsync() (PlayerEntity.cs:849-860,975-978) qui appelle
+`playerManager.SetPlayerAsync(Player)` -- lequel ecrit a la fois dans le
+cache Redis ET dans la base SQL via _dbPlayerRepository.SetPlayerAsync
+(src/Libraries/Game.Server/PlayerManager.cs:71-75). [HYPOTHESE] Si l'entite
+bot a un AccountId qui ne correspond a aucune ligne reelle de la table des
+comptes, cette ecriture peut echouer (contrainte de cle etrangere) ou, pire,
+polluer silencieusement la table des joueurs reels si aucune contrainte
+n'existe. Je n'ai pas inspecte le schema EF Core / les migrations pour
+confirmer la presence ou non d'une contrainte FK stricte sur AccountId --
+point a verifier avant d'exposer des bots persistants.
+
+[VERIFIE] Boucle de tick synchrone unique a 100Hz (GameServer.cs:29,50-55) :
+tout traitement ajoute par entite-bot (IA, pathfinding) s'execute sur le
+meme thread logique que tous les joueurs et monstres reels. Un comportement
+de bot couteux en CPU degraderait directement la latence de TOUS les
+joueurs, pas seulement du bot. A surveiller particulierement si le nombre de
+bots grandit.
+
+[VERIFIE] IGameServer.Connections n'inclut pas les connexions factices
+(section 4) : tout code qui suppose implicitement que "toute IGameConnection
+presente sur une PlayerEntity existe aussi dans gameServer.Connections"
+(aucun exemple trouve dans le code actuel, mais motif a surveiller lors de
+futurs ajouts) casserait pour un bot.
+
+[HYPOTHESE] SimpleBehaviour n'est pas directement applicable a une
+PlayerEntity pour le combat (casts explicites vers MonsterEntity, section 8)
+-- un comportement de bot-joueur devra etre ecrit specifiquement, meme s'il
+peut reutiliser une bonne partie de la logique de mouvement/aggro par
+copie/adaptation plutot que par reutilisation directe de la classe.
+
+[VERIFIE] Duplication de la diffusion de mouvement (section 7) : si un bot
+est deplace par du code custom hors du chemin CharacterMoveHandler, il faut
+reimplementer soi-meme l'envoi du paquet CharacterMoveOut aux joueurs proches
+(pas de methode generique existante "BroadcastMovement").
+
+[HYPOTHESE] Le systeme de plugins (Weikio.PluginFramework, ExamplePlugin/
+PrometheusPlugin dans src/Plugins) pourrait interagir de façon non prevue
+avec des entites-bots (ex. hooks IGameEntityLifetimeListener declenches a
+chaque spawn/despawn, vus dans World.cs:310-315,326-330,339-341) -- je n'ai
+pas audite les plugins fournis pour verifier qu'ils gerent correctement une
+IGameConnection non reseau (par exemple s'ils logguent ou utilisent
+BoundIpAddress/Server d'une maniere qui suppose un vrai socket).
+
+[HYPOTHESE] Handshake et cycle de connexion : IGameConnection expose
+`HandleHandshake(GcHandshakeData)`. Pour un bot cree hors du flux TCP, cette
+methode n'a probablement jamais besoin d'etre appelee (le handshake sert a
+synchroniser l'horloge avec un CLIENT reel) -- mais je n'ai pas verifie qu'
+aucun code ne l'appelle inconditionnellement sur toute IGameConnection
+associee a un joueur en jeu.
+
+
+12. CE QUE JE N'AI PAS PU DETERMINER
+================================================================================
+
+- Le schema exact de la base de donnees EF Core (GameDbContext, migrations)
+  n'a pas ete inspecte : je n'ai pas confirme si une contrainte de cle
+  etrangere stricte existe entre la table des joueurs et celle des comptes,
+  ce qui determine si un bot avec un AccountId factice peut etre persiste
+  sans erreur ou doit imperativement avoir un compte reel en base (ou
+  contourner completement PersistAsync/OnDespawnAsync). A verifier en lisant
+  src/Data/Game.Persistence (GameDbContext + dossier Migrations).
+
+- Le contenu detaille de Quest.cs, InternalQuest.cs et LevelUpQuest.cs
+  (src/Libraries/Game.Server/Quest/) n'a pas ete lu integralement : je ne
+  peux pas confirmer avec certitude l'etendue exacte (ou l'absence totale)
+  d'un moteur de dialogue scriptable au-dela du simple clic PNJ->boutique
+  observe dans World.cs. Mon affirmation "pas de vrai moteur de dialogue"
+  repose sur une recherche par mots-cles (Dialog/NpcDialog/QuestNpc) qui
+  n'a rien retourne de pertinent, pas sur une lecture exhaustive de ces
+  fichiers.
+
+- Le comportement precis de GameEventManager (src/Libraries/Game.Server/
+  GameEventManager.cs) au-dela du seul RegisterNpcClickEvent n'a pas ete
+  entierement lu ; il pourrait exister d'autres hooks utiles a un bot
+  (evenements de mort, de connexion, etc.) que je n'ai pas catalogues de
+  maniere exhaustive faute de temps.
+
+- Je n'ai pas verifie si un mecanisme de limitation/throttling (rate
+  limiting, anti-spam paquets) existe cote serveur qui pourrait, par
+  hypothese incorrecte de code, supposer une connexion reseau reelle
+  (ex. compteur base sur BoundIpAddress) et se comporter bizarrement avec un
+  bot partageant la meme IP que le serveur ou une IP factice.
+
+- Je n'ai pas inspecte src/Executables/Single (mode "tout-en-un") ni verifie
+  si son cycle de vie de connexion differe de celui du Game server standard
+  etudie ici -- l'analyse ci-dessus porte specifiquement sur
+  src/Executables/Game.
+
+- Je n'ai pas verifie l'impact d'un bot sur le systeme de groupe/guilde
+  (IGuildManager, GroupCommand) ni sur le chat (ChatManager) au-dela du point
+  deja note sur gameServer.Connections -- ces interactions n'ont pas ete
+  testees ni tracees en detail.
+
+- Les projets src/Libraries/Auth.Server et src/Executables/Auth n'ont pas ete
+  explores : hors perimetre de l'etude (le sujet porte sur le serveur de
+  jeu), mais a garder en tete si un bot doit un jour transiter par une
+  authentification "reelle" plutot que d'etre injecte directement cote jeu.
+
+
+13. MISE A JOUR -- IMPLEMENTATION REELLE (POST-ETUDE)
+================================================================================
+Date: 2026-08-21
+
+Cette section documente ce qui a ete effectivement construit et teste en jeu
+apres la redaction de l'etude ci-dessus (sections 1 a 12, laissees inchangees
+comme trace de l'analyse initiale). Le scenario A a ete confirme en pratique,
+pas seulement en theorie : un bot existe, est visible par un vrai client
+connecte, se deplace, combat, et despawn proprement.
+
+13.1 CE QUI A ETE CONSTRUIT
+--------------------------------------------------------------------------
+Tout le code vit sous src/Libraries/Game.Server/Bots/ :
+
+- NullGameConnection.cs -- implementation IGameConnection sans socket,
+  Send<T> est un no-op. Exactement le patron decrit section 4/10.
+- BotPlayerDataFactory.cs -- construit un PlayerData en memoire pour un bot
+  (jamais persiste, Id=0, AccountId factice fixe et deliberement different
+  de Guid.Empty -- voir le commentaire du fichier pour la raison precise
+  liee a DbPlayerRepository.GetPlayerAsync).
+- BotPlayerEntity.cs -- sous-classe de PlayerEntity : errance (wander)
+  periodique autour du point de spawn, aggro+poursuite+combat de melee
+  contre les monstres proches via un cone de frappe calcule manuellement
+  (le vrai client calcule ce cone lui-meme et envoie un paquet Attack par
+  cible touchee ; le serveur original n'a AUCUNE notion de cone/splash cote
+  serveur non plus, confirme par lecture du code source serveur original --
+  voir 13.3), equipement de depart automatique.
+- BotPlayerFactory.cs, BotRegistry.cs -- creation/suivi, miroir de
+  PlayerFactory produisant des BotPlayerEntity au lieu de PlayerEntity.
+- Commandes GM : /botspawn <Nom> [Classe], /botdespawn <Nom>
+  (Commands/SpawnBotCommand.cs, DespawnBotCommand.cs).
+
+Chemin de test reel utilise (variante de la section 10) : serveur lance via
+src/Executables/Single (SQLite + cache en memoire, zero dependance externe,
+voir 13.2), connexion avec un vrai client TMP4, /botspawn Yuki NINJA_FEMALE
+tape par l'utilisateur en jeu -- le bot apparait, bouge, combat, meurt/
+despawn sans erreur serveur.
+
+13.2 DECOUVERTE : LANCEMENT SANS DOCKER
+--------------------------------------------------------------------------
+[VERIFIE] Le depot peut tourner entierement en local sans Docker, MySQL ni
+Redis via src/Executables/Single (dotnet run --no-launch-profile) : SQLite
+(src/Executables/Single/data/database.db, deja rempli et persistant) +
+QuantumCore.Caching.InMemory.InMemoryRedisStore (voir
+src/Executables/Single/Program.cs:32-56). Ports 13001 (jeu) et 11002 (auth).
+Un personnage "Admin" (Id=1 en base) est preassigne au groupe OperatorGroup
+via les seeds EF Core (PermUser.cs) -- droits GM complets sans SQL manuel si
+le personnage reel s'appelle "Admin".
+
+13.3 BUGS REELS TROUVES ET CORRIGES DANS LE SERVEUR DE BASE
+--------------------------------------------------------------------------
+Quatre bugs preexistants, sans rapport avec la faisabilite des bots en soi,
+ont ete decouverts en testant le premier bot en conditions reelles -- ils
+auraient touche n'importe quel VRAI joueur dans les memes circonstances :
+
+1. PlayerSkills.cs (4 sites) : la garde
+   `_player.Player.SkillGroup.IsDefined()` est censee verifier "le joueur a
+   choisi une branche de competences", mais ESkillGroup.UNKNOWN=0 est
+   lui-meme un membre "defini" de l'enum -- la garde ne filtrait donc jamais
+   rien. Resultat : IndexOutOfRangeException dans
+   AssignDefaultActiveSkills() pour TOUT personnage fraichement cree (niveau
+   1, branche pas encore choisie), bot ou reel. Corrige via une methode
+   HasChosenSkillGroup() qui exclut explicitement UNKNOWN.
+
+2. Map.cs, boucle de despawn (Update()) : entity.Dispose() etait appele
+   AVANT le retrait de l'entite du QuadTree et des listes NearbyEntities des
+   autres joueurs. Si Dispose() levait une exception (observe : une race
+   Microsoft.Data.Sqlite lors d'une reconnexion quasi simultanee,
+   "Collection was modified" dans DisposePreparedStatements), le reste du
+   nettoyage ne s'executait jamais -- le personnage restait visible
+   indefiniment comme un fantome fige pour tous les autres joueurs. Corrige
+   en reordonnant (nettoyage du monde d'abord) et en encadrant Dispose()
+   d'un try/catch qui log sans jamais bloquer le nettoyage.
+
+3. QuickSlotBar.PersistAsync() fait un `_db.Players.FirstAsync(x => x.Id ==
+   Player.Player.Id)` -- leve pour un bot (Id=0, aucune ligne en base).
+   Contrairement a DbPlayerRepository.SetPlayerAsync/GetPlayerAsync (qui se
+   degradent proprement -- no-op / null -- pour un Id inexistant, verifie),
+   ce chemin plante dur. Solution retenue : les bots ne persistent jamais du
+   tout (OnDespawnAsync et LoadAsync surcharges dans BotPlayerEntity pour
+   sauter la persistance), plutot que de fiabiliser QuickSlotBar pour le cas
+   general.
+
+4. PlayerExtensions.SendCharacter envoyait Angle=0 en dur dans le paquet
+   SpawnCharacter au lieu de la vraie Rotation de l'entite (comparer
+   MonsterEntity.ShowEntity, qui envoie correctement Angle=Rotation).
+   Corrige. N'a PAS resolu le bug d'animation decrit en 13.4.
+
+13.4 LIMITE NON RESOLUE : ANIMATION D'ATTAQUE
+--------------------------------------------------------------------------
+[VERIFIE] Envoyer un paquet CharacterMoveOut avec MovementType=ATTACK ou
+COMBO fige DEFINITIVEMENT le rendu du bot cote client reel observateur : le
+personnage se bloque sur place, tourne seulement, cesse de recevoir toute
+mise a jour de position (le serveur continue de le deplacer, le client
+affiche une position perimee). Confirme par elimination en direct avec
+l'utilisateur : ni le "lunge" (pas en avant avant le coup), ni la valeur
+d'Argument du combo, ni l'equipement n'en sont la cause -- desactiver
+purement et simplement l'envoi de ce paquet restaure un mouvement fluide
+normal (juste sans animation de coup visible).
+
+Deux sources originales ont ete extraites et lues pour investiguer (voir
+memoire persistante [[client-server-original-source]] pour les chemins
+exacts) :
+- Client C++ original (ClientVS22.zip, UserInterface/InstanceBase.cpp) :
+  confirme que FUNC_ATTACK/FUNC_COMBO sont bien geres par une machine a
+  etats qui, si la position cible est a >=50 unites, fait d'abord marcher
+  le personnage puis joue le coup ; et confirme que c'est CHAQUE CLIENT
+  OBSERVATEUR qui choisit l'animation exacte a partir de ses propres
+  donnees de mouvement par race/arme, en utilisant seulement l'octet
+  Argument comme numero d'etape -- le bot n'a donc pas besoin de connaitre
+  l'ID d'animation exact.
+- Serveur C++ original (metin2_server+src.tar.gz,
+  server/game/src/char_battle.cpp/battle.cpp) : confirme qu'il n'existe
+  AUCUNE logique de cone/splash cote serveur, meme pour un vrai joueur --
+  CHARACTER::Attack ne traite qu'une victime a la fois ; le cone visuel
+  vient entierement du client, qui envoie un paquet Attack par cible
+  touchee. Ceci valide l'approche cote bot (section 13.1) comme etant
+  l'equivalent correct.
+
+Malgre cette lecture, la structure du paquet envoye par le bot correspond a
+ce que le code source original attend -- la cause exacte du figement n'a
+pas ete identifiee. Hypotheses non testees : version de protocole
+differente entre ce build client precis et celui vise par ce depot, champ
+ou paquet complementaire manquant ailleurs dans le flux (CharacterInfo ?
+un etat prealable requis ?), ou incompatibilite specifique a ce build.
+Necessite soit un outil de debug cote client (non disponible ici), soit une
+comparaison paquet-par-paquet avec une capture reseau d'un vrai combo joue
+par un vrai joueur.
+
+Etat actuel : l'envoi du paquet d'animation d'attaque est desactive dans
+BotPlayerEntity.cs (code laisse en place et documente, pas supprime) --
+comportement stable, bot pleinement fonctionnel sans swing visible.
+
+13.4bis DEUXIEME ROUND DE TESTS (2026-08-21 matin) -- BLOCAGE DUR RESOLU,
+        ANIMATION TOUJOURS ABSENTE
+--------------------------------------------------------------------------
+[VERIFIE] Le bot original (Yuki, NINJA_FEMALE) portait en fait un
+equipement illegal pour sa classe : les objets 11209/12209 (armure de
+corps et casque du set de depart fixe) ont AntiFlags=ASSASSIN (le nom
+interne de la classe Ninja), donc explicitement interdits -- ignore
+silencieusement par EquipWithoutPersisting, qui ne verifie jamais
+AntiFlags. Un vrai bug independant de la question de l'animation, a
+corriger : le set de depart devrait s'adapter a la classe du bot (sur le
+modele des listes par classe de FullSetCommand), pas rester fixe.
+
+Retest avec un bot WARRIOR_MALE (equipement desormais coherent avec sa
+classe), a cheval puis a pied : PLUS DE BLOCAGE DUR dans les deux cas. Vraie
+amelioration. Mais reactiver BroadcastAttack() ne fait toujours apparaitre
+AUCUNE animation de coup, et introduit un nouvel artefact mineur : des
+monstres a 5-10 metres de la position apparente du bot prennent parfois des
+degats (probablement un leger retard de rendu cote client, sans animation
+de coup pour ancrer visuellement le moment de l'impact -- pas un vrai
+desync : la position du bot se resynchronise, il ne se bloque jamais).
+Bilan : aucun benefice visuel a reactiver le paquet, un nouveau cout mineur
+-- reste desactive.
+
+Non isole : si c'est la correction de l'equipement, la suppression du
+lunge (round precedent), ou les deux combines qui ont fait disparaitre le
+blocage dur -- la combinaison exacte NINJA_FEMALE + equipement incoherent
++ a pied n'a pas ete retestee. La monture, elle, est disculpee (meme
+resultat monte et a pied dans les deux rounds).
+
+PROCHAINES ETAPES SUGGEREES, dans l'ordre : (1) corriger le bug
+d'equipement par classe (AntiFlags ignore) -- independant de la question de
+l'animation, a faire de toute facon ; (2) reessayer la combinaison exacte
+d'origine (mauvaise classe/equipement, a pied) pour isoler si l'equipement
+seul suffisait ; (3) si l'animation manque toujours avec un equipement
+propre, il faudra probablement un outil de debug cote client reel (capture
+reseau d'un vrai combo joue par un vrai joueur, ou debugger attache au
+client) -- la structure du paquet a maintenant ete verifiee correcte deux
+fois contre le code source original, la piste "lecture de code seule" est
+probablement epuisee.
+
+13.5 EQUIPEMENT DE DEPART
+--------------------------------------------------------------------------
+[VERIFIE] IDs d'objets reels verifies dans
+src/Executables/Single/data/item_proto (constantes Starter*Id dans
+BotPlayerEntity.cs) : arme (dague/lame courte), armure de corps, casque,
+bouclier -- variantes +9, toutes limitees au niveau 0. Dans ce jeu de
+donnees, chaque niveau de raffinage (+0 a +9) est un ID de proto SEPARE
+(base..base+9) -- il n'existe aucun champ "socket"/raffinage a l'execution
+sur ItemInstance (voir src/CorePluginAPI/Core/Models/ItemInstance.cs).
+L'equipement se fait via une nouvelle methode protected
+PlayerEntity.EquipWithoutPersisting(ItemInstance) qui reutilise
+IItemManager.GetWearSlot/Equipment.GetWearPosition pour trouver
+automatiquement le bon emplacement, sans jamais toucher au cache ni a la
+base -- ajoutee au meme titre que EquipStarterGear() dans BotPlayerEntity.
+
+13.6 CONCLUSION MISE A JOUR (avant l'ajout de la monture, voir 14)
+--------------------------------------------------------------------------
+Le scenario A (decouplage facile) est desormais confirme empiriquement, pas
+seulement par lecture de code : un bot complet (existence, visibilite,
+deplacement autonome, IA de combat basique, equipement, cycle de vie
+propre) fonctionne dans ce depot avec un effort de developpement de l'ordre
+de quelques centaines de lignes reparties sur 6 fichiers neufs et 4
+correctifs cibles dans le code existant. Le seul point non resolu est
+cosmetique (animation de swing visible), pas architectural -- il ne remet
+pas en cause la faisabilite mais reste a investiguer pour un rendu visuel
+complet.
+
+
+14. MONTURE (CHEVAL) -- AJOUTE DE NUIT, NON ENCORE VERIFIE VISUELLEMENT
+================================================================================
+Date: 2026-08-21 (nuit), en l'absence de l'utilisateur -- a tester en
+premier au reveil, avant tout autre travail sur ce depot.
+
+[VERIFIE, via lecture du code source client et serveur originaux -- voir
+memoire persistante [[client-server-original-source]]] La monture n'est PAS
+une entite speciale ni un systeme complexe : c'est un unique champ
+MountVnum (id de proto monstre) diffuse dans les paquets d'info du
+personnage monte lui-meme (char_horse.cpp, packet.h : struct
+packet_add_char/packet_update_char/packet_char_additional_info avec un
+champ dwMountVnum). Le client remplace alors l'animation de marche/course
+du personnage par celle de la monture des que ce champ est non-nul.
+
+[VERIFIE, decouverte cle] Ce champ MountVnum existait DEJA, present mais
+jamais rempli, sur les deux paquets C# correspondants :
+src/CorePluginAPI/Packets/CharacterInfo.cs et CharacterUpdate.cs. Le travail
+s'est donc limite a le renseigner, pas a l'ajouter au format binaire.
+
+Ce qui a ete fait :
+- IPlayerEntity.MountVnum (uint, lecture seule), Mount(uint vnum),
+  Unmount() -- implementes sur PlayerEntity, donc utilisables par N'IMPORTE
+  QUEL joueur, pas seulement les bots.
+  src/CorePluginAPI/Game/World/IPlayerEntity.cs,
+  src/Libraries/Game.Server/World/Entities/PlayerEntity.cs.
+- PlayerExtensions.SendCharacterAdditional/SendCharacterUpdate transmettent
+  desormais MountVnum (src/CorePluginAPI/Extensions/PlayerExtensions.cs).
+- Deux commandes GM pour tester directement sur un VRAI personnage,
+  independamment du bot : /mount [vnum] (defaut 20030 = "Horse", verifie
+  present dans src/Executables/Single/data/mob_proto et correspondant a la
+  valeur par defaut CHARACTER::GetMyHorseVnum() du serveur original) et
+  /dismount (Commands/MountCommand.cs, Commands/DismountCommand.cs).
+- BotPlayerEntity monte automatiquement sur le vnum 20030 juste apres avoir
+  equipe son equipement de depart, dans son LoadAsync() (toujours monte des
+  le spawn, pas de logique de descente pour le combat dans cette premiere
+  version).
+
+Deliberement PAS fait, pour garder une etape testable et propre plutot que
+d'empiler des hypotheses non verifiees (cf. la mesaventure de l'animation
+d'attaque, section 13.4, ou plusieurs changements caches les uns dans les
+autres ont complique le diagnostic) : pas de monture-compagnon autonome
+visible quand on n'est pas dessus, pas de bonus de vitesse de deplacement
+lie a la monture, pas de statistiques par niveau de monture.
+
+MARCHE A SUIVRE AU REVEIL : tester /mount sur le personnage Admin reel
+D'ABORD (isole le mecanisme de base de tout ce qui est specifique au bot),
+puis seulement ensuite juger du montage automatique des bots. Si /mount ne
+fonctionne pas sur un vrai personnage, le probleme est dans le champ/paquet
+lui-meme, pas dans le bot. Si /mount fonctionne mais pas le bot, chercher
+du cote de l'ordre d'envoi des paquets a la creation (Mount() est appele
+avant meme le spawn dans le monde, donc avant que quiconque soit "proche"
+pour recevoir le SendCharacterUpdate -- seul le futur SendCharacterAdditional
+envoye au moment ou le bot devient visible transporte alors l'info, ce qui
+devrait suffire mais n'a pas ete confirme en jeu).
+
+
+15. MONTURE -- CONFIRMEE FONCTIONNELLE EN JEU, PALIERS REELS AJOUTES
+================================================================================
+Date: 2026-08-21 (matin)
+
+[VERIFIE en jeu par l'utilisateur] Monter, descendre, animation de
+chevauchee, apparence par palier, ET frapper depuis le cheval (des le
+palier 11+) fonctionnent tous correctement.
+
+15.1 LE VRAI BUG QUI EMPECHAIT LE RENDU
+--------------------------------------------------------------------------
+Premier essai de /mount sur le personnage Admin reel : la commande
+confirmait "Mounted on proto 20030" dans le chat, mais RIEN ne changeait
+visuellement -- alors qu'un bot monte AVANT meme d'etre affiche au client
+fonctionnait du premier coup. La cause, trouvee en lisant char.cpp du
+serveur original :
+
+CHARACTER::MountVnum() n'envoie PAS un simple paquet de mise a jour
+(UpdatePacket/TPacketGCCharacterUpdate) -- il appelle EncodeInsertPacket(this)
+pour soi-meme ET pour chaque entite proche, c'est-a-dire qu'il renvoie
+integralement la sequence "ce personnage vient d'apparaitre" (l'equivalent
+exact de SpawnCharacter+CharacterInfo, donc de ShowEntity() dans ce depot),
+plutot qu'un paquet incremental. C'est pour ca qu'un bot monte avant son
+premier affichage marchait sans rien faire de special : sa toute premiere
+apparition portait deja le bon MountVnum, aucune "transition a chaud"
+n'etait necessaire.
+
+Correction dans PlayerEntity.Mount() : remplace l'appel a
+SendCharacterUpdate() par un rappel de ShowEntity() sur sa propre connexion
+et sur celle de chaque PlayerEntity proche.
+
+LECON GENERALE POUR CE DEPOT, potentiellement applicable au bug d'animation
+d'attaque encore ouvert (section 13.4) : quand un changement d'etat visible
+cote client fonctionne au premier affichage mais pas lors d'une mise a jour
+a chaud sur un personnage deja visible, soupconner que le chemin de mise a
+jour a chaud necessite le meme renvoi complet ("re-insert"), pas juste un
+paquet incremental.
+
+15.2 PALIERS D'APPARENCE REELS (donnees exactes, pas d'approximation)
+--------------------------------------------------------------------------
+[VERIFIE, source c_aHorseStat[HORSE_MAX_LEVEL+1] dans horse_rider.cpp du
+serveur original] PlayerData.HorseLevel (byte, 0-30, NON PERSISTE en base
+pour l'instant -- revient a 0 a chaque redemarrage/connexion, simplification
+volontaire de premiere iteration) pilote l'apparence via
+HorseVnums.ForLevel() (src/Libraries/Game.Server/HorseVnums.cs), avec les
+vraies valeurs du jeu original (pas devinees) :
+- Niveau 0 : pas de monture.
+- Niveaux 1-10 : proto 20101 (palier de base, "cho-gi"/initial).
+- Niveaux 11-20 : proto 20104 (palier intermediaire, armure legere --
+  confirme : on peut deja frapper depuis le cheval a ce palier).
+- Niveaux 21-30 : proto 20107 (palier final, cheval de guerre, grosse
+  armure -- le jeu original donne aussi des sorts specifiques a ce palier,
+  explicitement hors perimetre ici sur demande de l'utilisateur).
+La colonne iMinLevel de la table originale (niveau de PERSONNAGE requis :
+25/35/50 selon le palier) n'a pas ete implementee -- le niveau de monture se
+regle directement par commande, sans condition de niveau de personnage.
+
+Commandes ajoutees : /mount (utilise le HorseLevel de l'appelant ; /mount
+<vnum> permet de forcer un proto arbitraire pour les tests GM),
+/dismount, /sethorselevel <0-30> (seul moyen actuel de debloquer /mount,
+aucune quete ni progression automatique). Les bots recoivent
+HorseLevel=30 (palier de guerre) automatiquement a la creation
+(BotPlayerDataFactory.cs) et montent seuls dans BotPlayerEntity.LoadAsync().
+
+15.3 CE QUI N'A DELIBEREMENT PAS ETE FAIT (mis a jour -- persistance faite
+     depuis, voir 16.2)
+--------------------------------------------------------------------------
+Prochaines iterations possibles, aucune commencee : les vrais bonus de
+stats par palier (sante/stamina/ST/DX/degats de c_aHorseStat -- seule la
+colonne d'apparence iNPCRace a ete exploitee pour l'instant), les sorts
+specifiques au palier de guerre, la condition de niveau de personnage, un
+cheval-compagnon visible quand on n'est pas dessus, une progression par
+nourriture/quete.
+
+
+16. CORRECTIF EQUIPEMENT PAR CLASSE + PERSISTANCE DU NIVEAU DE CHEVAL
+================================================================================
+Date: 2026-08-21 (matin, suite du round 13.4bis)
+
+16.1 EQUIPEMENT PAR CLASSE (bug reel, independant de la question animation)
+--------------------------------------------------------------------------
+[VERIFIE, via item_proto] Table complete des AntiFlags interrogee pour les
+4 classes. Resultats :
+- Arme "도" (id 10-19, +9=19) : AntiFlags=SHAMAN uniquement -> utilisable
+  par Guerrier/Ninja/Sura, PAS par Chaman.
+- Bouclier "호신환패" (id 13000-13009, +9=13009) : AntiFlags=0 -> tout le
+  monde.
+- Armure de corps/casque : specifiques a chaque classe, aucun
+  chevauchement :
+  - Guerrier : corps 11200-11209 (+9=11209), casque 12200-12209 (+9=12209)
+  - Ninja (ASSASSIN) : corps 11400-11409 (+9=11409), casque 12340-12349
+    (+9=12349)
+  - Sura : corps 11600-11609 (+9=11609), casque 12480-12489 (+9=12489)
+  - Chaman : corps 11800-11809 (+9=11809), casque 12620-12629 (+9=12629),
+    arme "백선" (eventail, id 7000-7009, +9=7009) puisque "도" lui est
+    interdit
+
+BotPlayerEntity.GetStarterGearFor(EPlayerClass) retourne desormais le bon
+triplet arme/corps/casque selon la classe reelle du bot (le bouclier reste
+fixe, universel). EquipStarterGear() utilise cette table au lieu des 3
+constantes fixes precedentes.
+
+16.2 PERSISTANCE DE HorseLevel EN BASE
+--------------------------------------------------------------------------
+[VERIFIE en base reelle] PlayerData.HorseLevel est desormais une vraie
+colonne EF sur l'entite Player (src/Data/Game.Persistence/Entities/Player.cs),
+migree sur les 3 fournisseurs (migration "AddHorseLevel" dans
+src/Data/Game.Persistence/Migrations/{Sqlite,Mysql,Postgresql}/), mappee
+dans QueryExtensions.SelectPlayerData et DbPlayerRepository.CreateAsync/
+SetPlayerAsync. Confirme directement en interrogeant
+src/Executables/Single/data/database.db : la colonne existe, la migration
+apparait dans __EFMigrationsHistory.
+
+Note technique : la generation de la migration MySQL necessite normalement
+un vrai serveur MySQL accessible (ServerVersion.AutoDetect se connecte
+reellement) -- indisponible ici. Contourne en fixant temporairement une
+version MySQL en dur dans MySqlGameDbContext.OnConfiguring le temps de la
+commande `dotnet ef migrations add`, puis en annulant ce changement
+immediatement apres (confirme sans diff residuel via git diff).
+
+Aucun changement de code necessaire pour que la persistance fonctionne a la
+deconnexion : /sethorselevel modifie juste PlayerData.HorseLevel en memoire
+comme n'importe quelle autre commande de statistique de ce depot ;
+PlayerEntity.PersistAsync() (deja appele a la deconnexion normale) le
+sauvegarde automatiquement puisqu'il passe desormais par SetPlayerAsync.
+
+16.3 LIEN AVEC LE BUG D'ANIMATION D'ATTAQUE
+--------------------------------------------------------------------------
+Le correctif d'equipement par classe (16.1) etait deja identifie comme
+cause probable du blocage dur observe en 13.4/13.4bis. Non re-teste de
+maniere isolee (la combinaison exacte "mauvaise classe/equipement a pied"
+n'a pas ete rejouee apres coup) -- mais c'est de toute facon un vrai bug a
+corriger independamment du resultat sur l'animation.
+
+================================================================================
+17. QUETE "HORSE TRIAL" (deblocage du cheval en jeu) + BUG DE FUITE
+    D'EVENEMENTS DE QUETE (blocage client resolu)
+================================================================================
+Date: 2026-08-21
+
+17.1 QUETE HORSE TRIAL
+--------------------------------------------------------------------------
+Nouveau fichier : src/Libraries/Game.Server/Quest/HorseTrialQuest.cs.
+Remplace /sethorselevel par un chemin de jeu normal pour debloquer le
+niveau 1 du cheval : parler au palefrenier (NPC vnum 20349, reel -- confirme
+via shops.tsv/npc.txt, "Stable Boy"), lui donner une "Medaille equestre"
+(item id 50050, reel, utilise par horse_ride.quest / horse_exchange_ticket.
+quest / horse_upgrade.quest dans les sources originales), puis tuer 100
+"Archers Barbares" (mob id 503, reel, niveau 35 dans mob_proto de ce depot)
+en moins de 30 minutes. Niveau de personnage 10 requis (horse_ride.quest).
+
+Chiffres cites avec leur source exacte dans le commentaire du fichier :
+le couple "100 kills / 30 minutes" vient du test de passage grade 1->2 de
+horse_upgrade.quest (reference reelle la plus proche trouvee -- les
+chiffres du tout premier deblocage n'ont pas ete localises tels quels).
+Sur demande explicite de l'utilisateur, la progression (_killCount /
+_deadline) reste en memoire uniquement, non persistee ("on verra apres") --
+seul le resultat final (HorseLevel=1) est sauvegarde, via le mecanisme deja
+en place (16.2).
+
+Nouveau hook ajoute a GameEventManager : RegisterMonsterKillEvent /
+OnMonsterKillAsync (equivalent du declencheur <mobvnum>.kill du jeu
+original), branche depuis Entity.Damage() sur la branche "monstre tue".
+Contrairement aux evenements NPC (un seul gagnant, avec menu de choix si
+plusieurs), TOUS les kill-events correspondants sont declenches (plusieurs
+quetes peuvent suivre le meme kill sans ambiguite a lever).
+
+Bug reel corrige au passage : ItemExtensions.GetWearSlot(EWearFlags)
+levait NotImplementedException pour tout objet non equipable (medaille,
+consommable, monnaie...) au lieu de renvoyer null comme le prevoyait son
+propre type de retour nullable -- cassait /item 50050 et plus generalement
+le placement de n'importe quel objet non equipable en inventaire. Corrige.
+
+17.2 BUG TROUVE : FUITE DES ENREGISTREMENTS D'EVENEMENTS DE QUETE
+    (cause reelle du blocage client observe)
+--------------------------------------------------------------------------
+Symptome rapporte par l'utilisateur : en parlant au palefrenier et en
+choisissant "Horse Trial", des bandes noires (letterbox) apparaissent en
+haut/bas de l'ecran et le client reste bloque, injouable (Echap, quitter,
+toute commande : plus rien ne repond).
+
+Premiere piste exploree (et ecartee apres verification complete) : un bug
+dans le tokenizer du client pour les balises [QUESTION ...]. Le parser reel
+a ete retrouve et lu integralement dans les sources client d'origine
+(EterLib/parser.h + parser.cpp, fonction Group::GetArg) : le format
+"1;Start the trial|2;Not now" genere par Quest.ChoiceAsync() est en fait
+correctement gere -- les espaces internes aux libelles sont bien preserves
+par ce parser (seul un espace juste apres un "|" ou en tout debut est
+ignore). Verifie caractere par caractere sur l'exemple reel. Ce n'etait
+donc pas le probleme.
+
+Cause reelle trouvee en remontant QuestManager.InitializePlayer : cette
+methode est appelee a CHAQUE PlayerEntity.LoadAsync() -- c'est-a-dire a
+chaque connexion reelle ET a chaque /botspawn -- et re-enregistre a chaque
+fois les gestionnaires de clic/don/kill de TOUTES les quetes via Quest.
+Init() dans les dictionnaires STATIQUES de GameEventManager
+(NpcClickEvents, NpcGiveEvents, desormais aussi MonsterKillEvents). Rien ne
+nettoyait jamais les anciens enregistrements : BotPlayerEntity.
+OnDespawnAsync() court-circuitait meme entierement la logique de despawn
+(y compris ce nettoyage) pour eviter un crash de persistance different (cf.
+section anterieure du rapport). Avec le nombre de cycles /botspawn +
+/botdespawn et de reconnexions de cette session, NpcClickEvents[20349] a
+accumule un grand nombre d'entrees "Horse Trial" dupliquees, chacune liee
+par fermeture (closure) a un IPlayerEntity obsolete/mort. Les Vid (id de
+session) etant reutilises apres depart d'un joueur/bot, un clic pouvait
+alors correspondre a plusieurs entrees perimees a la fois -- ce qui
+declenche cote serveur un menu de desambiguisation
+(InternalQuest.SelectQuestAsync) : c'est tres probablement ce que
+l'utilisateur a vu en "choisissant Horse Trial" (parmi plusieurs entrees
+dupliquees), et invoquer un callback lie a un joueur/connexion mort est ce
+qui a fige le client.
+
+Corrige par :
+1. Ajout d'un champ uint? PlayerVid explicite sur les 3 structures
+   d'evenement de GameEventManager (null reserve aux enregistrements
+   veritablement globaux comme les boutiques PNJ, qui ne doivent jamais
+   etre balayes par le nettoyage).
+2. Nouvelle methode GameEventManager.UnregisterPlayer(uint vid) qui retire
+   toutes les entrees de ce Vid dans les 3 dictionnaires.
+3. Appelee au debut de QuestManager.InitializePlayer (couvre un Vid
+   reutilise dont le proprietaire precedent n'a pas proprement quitte) ET
+   depuis PlayerEntity.OnDespawnAsync / BotPlayerEntity.OnDespawnAsync
+   (couvre un depart normal -- les bots nettoient desormais leurs
+   evenements de quete au despawn, meme s'ils sautent toujours la
+   persistance en base).
+
+Lecon generale pour ce depot : tout enregistrement par-joueur dans une
+collection static doit avoir un chemin de nettoyage par-joueur symetrique ;
+et un override "skip persistence" trop large sur un bot (comme
+OnDespawnAsync() => Task.CompletedTask) peut faire sauter d'autres
+nettoyages non lies a la persistance sans que ce soit voulu.
+
+Build + serveur relance avec le correctif (dotnet build sur Game.Server,
+Executables/Single et Game.Tests tous verts). En attente de re-test par
+l'utilisateur : parler au palefrenier (NPC 20349), lancer "Horse Trial",
+confirmer que le menu de choix est propre (2 options seulement) et que le
+dialogue se deroule sans blocage.
+
+================================================================================
+18. SUITE DE L'INVESTIGATION DU BLOCAGE : LE PROBLEME EST CLIENT, PAS SERVEUR
+================================================================================
+Date: 2026-08-21 (apres-midi)
+
+Apres le correctif de 17.2 (fuite d'enregistrements), le meme blocage
+(bandes noires, plus rien ne repond) persistait a l'identique. Nouvelle
+serie de tests, avec logs de diagnostic temporaires ajoutes puis retires
+(GameEventManager.OnNpcClickAsync / Quest.SendScript / Quest.Answer /
+ClickNpcHandler), en coordination directe avec l'utilisateur pour chaque
+essai :
+
+18.1 BUG REEL TROUVE ET CORRIGE AU PASSAGE : NOM DE BOUTIQUE VIDE
+--------------------------------------------------------------------------
+TsvShopProvider ne lisait jamais la colonne "name" de shops.tsv, et
+ShopMonsterInfo n'avait meme pas de champ Name pour la transporter --
+chaque boutique PNJ s'enregistrait avec un nom d'evenement VIDE. Sans
+consequence tant qu'une boutique etait seule sur son PNJ, mais des que
+HorseTrialQuest s'est aussi enregistree sur le PNJ 20349, le menu de
+desambiguisation resultant affichait une premiere option VIDE
+([QUESTION 1;|2;Horse Trial]). Corrige : ShopMonsterInfo porte desormais
+Name, TsvShopProvider lit la colonne 1, World.LoadShops() le relie a Shop
+et a l'enregistrement. Confirme en direct par trace de paquet que le menu
+s'affiche bien correctement ensuite ([QUESTION 1;Stable Boy|2;Horse
+Trial]) -- mais le client se bloque quand meme, a l'identique.
+
+18.2 ISOLATION : LE BUG EST GENERIQUE, PAS LIE A HORSE TRIAL
+--------------------------------------------------------------------------
+Teste avec TestQuest (PNJ 20354, "Hello World...", totalement independant
+des chevaux, deja present dans le depot avant cette session) : bloque de
+la meme facon, confirme en direct par l'utilisateur. Le bug touche donc le
+mecanisme [QUESTION] lui-meme, pas HorseTrialQuest ni le chemin de
+desambiguisation a plusieurs gestionnaires.
+
+18.3 BISSECTION PAR CONTENU
+--------------------------------------------------------------------------
+- Text("Hi") + Done() seul (un seul paquet, ni [NEXT] ni [QUESTION]) :
+  confirme en direct -- fonctionne parfaitement, bandes noires
+  apparaissent et disparaissent correctement.
+- Text("Pick one:") + ChoiceAsync(...) (un seul paquet, texte reel avant
+  le [QUESTION], pas d'envoi double a la suite) : l'utilisateur voit et
+  clique une option ("2nd option") -- puis blocage. AUCUN paquet
+  QuestAnswer n'atteint jamais le serveur (confirme via le log
+  pre-existant de QuestAnswerHandler, "Quest answer: {Answer}", qui ne
+  s'est jamais declenche).
+
+18.4 CONCLUSION
+--------------------------------------------------------------------------
+Le blocage se situe donc dans la gestion du clic sur une option
+[QUESTION] cote CLIENT, APRES un rendu et un clic reussis, mais AVANT
+l'envoi de la reponse au serveur -- ce n'est ni un bug de format de
+paquet (verifie octet par octet contre TPacketGCScript/RecvScriptPacket
+du client reel) ni un bug de contenu du script (verifie caractere par
+caractere contre le vrai tokenizer EterLib/parser.cpp).
+
+syserr.txt (le journal d'erreurs Python du client) reste a 0 octet meme
+juste apres un force-close consecutif au blocage -- ce n'est donc
+probablement pas une exception Python attrapable, mais plutot un blocage/
+deadlock dans du code natif, ou un chargement de ressource qui ne revient
+jamais. Pour aller plus loin il faudrait soit les scripts Python de
+l'interface (compiles dans pack/root.epk du client, chiffres, absents des
+sources C++ moteur utilisees jusqu'ici), soit un outil de debug/capture
+reseau en direct -- aucun des deux disponible ici.
+
+Bilan : le systeme de dialogue de quete cote serveur (paquets, balises,
+Quest.cs) est verifie correct contre le protocole reel ; c'est
+l'installation client testee qui semble incapable de gerer le clic sur
+une option [QUESTION] sans se bloquer, pour une raison exterieure au code
+serveur. /sethorselevel reste la solution de repli fonctionnelle pour
+regler HorseLevel en attendant. Un dialogue de quete sans choix
+(Text()/Done() seul) fonctionne normalement.
+
+Tous les logs de diagnostic temporaires ont ete retires (confirme sans
+diff residuel via git diff), seuls les vrais correctifs (nom de boutique,
+fuite d'evenements) restent dans le code.
+
+================================================================================
+19. SUITE : SOURCES PYTHON REELLES TROUVEES, MAIS PAS CHARGEES PAR CE CLIENT +
+    CORRECTIF Next() + COMMANDE /shutdown POUR LA PERSISTANCE PROPRE
+================================================================================
+Date: 2026-08-21 (fin d'apres-midi)
+
+19.1 SOURCES PYTHON REELLES DISPONIBLES -- MAIS PAS CELLES CHARGEES
+--------------------------------------------------------------------------
+Decouverte : F:\GitHub\ClientMT2\Client\Eternexus\root\uiquest.py existe en
+clair (a cote du pack/root.epk chiffre). Chaine de clic tracee entierement :
+AppendQuestion/MakeNextButton -> event.SelectAnswer(descIndex, answer)
+(natif C++) -> CPythonEventManager::SelectAnswer -> SendScriptAnswerPacket
+(header HEADER_CG_SCRIPT_ANSWER / 0x1D, correspond exactement au paquet
+QuestAnswer de ce depot).
+
+Instrumente cette chaine (logs fichier + essai) puis test definitif sans
+risque : renommage du bouton "Ok" en "DEBUGDONE". Resultat : le bouton
+affiche toujours "Ok" normalement -- ce client NE charge PAS ce fichier en
+clair, il doit lire pack/root.epk (chiffre) a la place. Toutes les
+modifications ont ete annulees (fichier revenu a ses 904 lignes d'origine,
+verifie). Cette piste est donc une impasse tant qu'on n'a pas d'outil pour
+re-empaqueter l'epk.
+
+19.2 BUG REEL CORRIGE : Next() N'ATTENDAIT JAMAIS LE CLIENT
+--------------------------------------------------------------------------
+Quest.Next() envoyait le paquet [NEXT] et rendait la main IMMEDIATEMENT
+(methode void, jamais attendue), donc TestQuest envoyait sa deuxieme page
+([QUESTION ...]) tout de suite apres la premiere, avant meme que le joueur
+ait pu cliquer sur "suivant" -- deux paquets QuestScript coup sur coup.
+Corrige : renommee en NextAsync(), retourne la Task completee par
+Answer(254) (le clic sur le bouton Next cote client), l'appelant doit
+desormais faire "await NextAsync();". Bug reel et confirme utile : apres
+correctif, le test va plus loin (le blocage se produit maintenant sur le
+clic du bouton [NEXT] lui-meme, plus immediatement a l'affichage) -- mais
+bloque quand meme la, donc il reste au moins un autre probleme cote client
+distinct de celui-ci.
+
+19.3 NOUVELLE COMMANDE /shutdown + PERSISTANCE PROPRE A L'ARRET
+--------------------------------------------------------------------------
+Question annexe de l'utilisateur : pourquoi il est teleporte a son point de
+connexion au lieu de son point de deconnexion apres chaque relance du
+serveur. Cause reelle : GameServer.ExecuteAsync ne persistait JAMAIS les
+joueurs connectes a l'arret, peu importe la methode d'arret. Corrige :
+bloc ajoute apres la boucle de tick qui appelle OnDespawnAsync() (sauvegarde
+position etc.) pour chaque joueur encore connecte des que stoppingToken
+est reellement annule.
+
+Mais un taskkill /F ne declenche aucun signal propre (contourne totalement
+ce chemin), et taskkill SANS /F refuse purement et simplement sur les
+executables console de ce projet ("ce processus ne peut etre arrete que de
+force" -- confirme en direct, pas de handle de fenetre a fermer). Ajoute
+donc Commands/ShutdownCommand.cs (/shutdown, reserve GM, injecte
+IHostApplicationLifetime.StopApplication()) comme vrai moyen de declencher
+un arret propre depuis le chat en jeu -- confirme fonctionnel en direct :
+le log affiche bien "Persisting connected players before shutdown..." et
+le processus se termine avec le code 0 (pas tue de force). A utiliser
+desormais (/shutdown demande au joueur connecte) plutot que taskkill pour
+tout redemarrage en cours de session, afin de ne plus faire perdre la
+position du joueur connecte.
+
+================================================================================
+20. STATS REELLES PAR PALIER DE CHEVAL -- TERMINE ET VERIFIE
+================================================================================
+Date: 2026-08-21 (soiree)
+
+Nouveau fichier src/Libraries/Game.Server/HorseStats.cs : reprend telles
+quelles les colonnes ST/DX/HT/IQ/Armure de la vraie table c_aHorseStat[]
+(horse_rider.cpp, niveaux 0 a 30). Colonnes vie/stamina/degats du cheval
+volontairement non reprises (systeme separe de vie/faim du cheval, hors
+perimetre pour l'instant -- cf commentaire du fichier).
+
+Verifie contre le vrai CHARACTER::ComputePoints() (char.cpp) que ce sont
+des PLANCHERS, pas des bonus additifs : monte, chaque stat ST/DX/HT/IQ et
+l'armure devient max(valeur du joueur, valeur du cheval au niveau actuel).
+Branche dans PlayerEntity.GetPoint() (cas ST/DX/HT/IQ) et
+CalculateDefence() (armure), actif uniquement si MountVnum != 0. Mount()
+appelle desormais aussi CalculateDefence() + SendPoints() pour que le client
+voie le changement immediatement en montant/descendant, pas seulement a la
+prochaine connexion.
+
+Premier test en direct : "aucun changement visible" -- ressemblait a un bug,
+n'en etait pas un. Logs de diagnostic temporaires (ajoutes puis retires,
+sans residu au git diff) ont montre les vrais chiffres : BaseSt=249,
+BaseDx=99, BaseHt=99, BaseIq=99 (stats de l'Admin, probablement gonflees
+via commandes GM plus tot dans la session) contre un plancher cheval de
+palier final de 67/89/45/22, et GetPointDef=559 contre un plancher
+d'armure de 59 -- les stats de l'Admin depassaient deja tres largement ce
+que meme le meilleur cheval pourrait offrir, donc Math.Max renvoyait
+logiquement la valeur de base inchangee. Comportement confirme CORRECT,
+pas un bug -- pour voir l'effet en direct il faut tester sur un
+personnage/bot proche des stats de depart (un bot via /botspawn par
+exemple), pas sur cet Admin tres gonfle par les tests de cette session.
+
+Au passage, deux autres correctifs reels :
+- Quest.Next() renomme en NextAsync() (retourne desormais la Task du clic
+  "suivant" cote client, a await-er par l'appelant) -- ne faisait
+  auparavant qu'envoyer le paquet et rendre la main immediatement,
+  laissant partir un deuxieme paquet QuestScript avant meme que le joueur
+  ait pu accuser reception du premier.
+- GameServer.cs + nouvelle commande /shutdown (voir section 19.3) :
+  persistance propre a l'arret, deja documentee plus haut.
+
+Enfin, trouve cette session : lancer le serveur de dev via le suivi de
+taches en arriere-plan du harnais (Bash run_in_background) se faisait
+tuer silencieusement par l'environnement lui-meme apres un certain temps
+d'inactivite entre les tours de conversation (5 fois de suite, sans lien
+avec un appel ScheduleWakeup d'abord suspecte puis ecarte -- le probleme
+est revenu meme sans cet appel). Contourne en lancant plutot un processus
+reellement detache au niveau OS (PowerShell Start-Process -WindowStyle
+Hidden avec redirection de sortie vers fichier), qui survit aux periodes
+d'inactivite -- a utiliser desormais pour le serveur de dev de ce depot
+plutot que run_in_background.
+
+================================================================================
+21. CORRECTIF DE LA PERSISTANCE A L'ARRET : LA BOUCLE AJOUTEE ETAIT
+    REDONDANTE ET PROVOQUAIT UNE VRAIE RACE CONDITION
+================================================================================
+Date: 2026-08-21 (soiree, suite immediate de la section 20)
+
+Au redemarrage suivant, une exception reelle est apparue au moment du
+/shutdown : "A second operation was started on this context instance
+before a previous operation completed" (EF Core) au moment de persister
+Admin. Investigation : GameConnection.OnCloseAsync(expected: false) ->
+World.DespawnPlayerAsync -> PlayerEntity.OnDespawnAsync() existait DEJA et
+se declenche tout seul des que le token d'arret de ServerBase est annule
+(ce que /shutdown fait via IHostApplicationLifetime.StopApplication()) --
+chaque connexion encore ouverte voit alors sa lecture socket annulee et
+traite ca comme une deconnexion inattendue, qui persiste deja le joueur.
+La boucle explicite ajoutee en section 19.3 faisait donc EXACTEMENT LA
+MEME CHOSE une seconde fois, en parallele, sur la meme instance de
+DbContext -- d'ou la race. Confirme empiriquement que ce chemin
+preexistant suffisait deja a lui seul.
+
+Corrige en supprimant purement et simplement la boucle explicite de
+GameServer.ExecuteAsync. La commande /shutdown reste necessaire et utile
+(toujours le seul moyen trouve de declencher un arret propre, taskkill
+sans /F refusant toujours sur les executables console de ce depot) mais
+n'a plus besoin d'aucune logique de persistance additionnelle -- le
+chemin de deconnexion inattendue s'en charge deja tout seul.
+
+================================================================================
+22. NOUVELLE TENTATIVE SUR L'ANIMATION D'ATTAQUE -- TOUJOURS NON RESOLUE
+================================================================================
+Date: 2026-08-21 (soiree)
+
+Lu le vrai traitement C++ du client pour ATTACK/COMBO (InstanceBase.cpp,
+ProcessAffect/cas FUNC_ATTACK) : le client ne joue l'animation de coup
+(RunNormalAttack/RunComboAttack) immediatement que si la position du
+paquet est a moins de ~50 unites de la ou il pense que se trouve
+l'attaquant -- sinon il fait d'abord marcher l'attaquant jusque-la. Trouve
+un vrai ecart, correct independamment du reste : BotPlayerEntity.
+UpdateCombat pouvait arreter de poursuivre et commencer a attaquer en
+pleine marche (cote serveur Entity.Update() interpole bien a chaque tick,
+mais le client observateur n'etait jamais informe que la marche s'etait
+arretee tot -- il continuait d'interpoler vers la destination ORIGINALE du
+Goto() pendant le reste de la Duration de ce mouvement). Corrige en
+arretant explicitement (Stop()) et en diffusant un MOVE correctif a duree
+nulle (nouvelle methode BroadcastStop()) vers la position actuelle reelle
+du bot avant d'envoyer le paquet d'attaque, puis reactive BroadcastAttack()
+(qui etait commente).
+
+Teste en direct, effet confirme NUL : l'animation ne s'affiche toujours
+jamais, les kills continuent d'apparaitre visuellement loin du bot, a
+l'identique d'avant le correctif (l'etat monte/demonte du cheval a aussi
+ete ecarte comme facteur : meme symptome avec des bots qui spawnent
+completement a pied). Correctif conserve quand meme (correct
+independamment vis-a-vis du vrai comportement de suivi de position du
+client, ne peut pas faire de mal) mais la theorie du seuil de ~50 unites
+n'est manifestement pas le principal frein a elle seule. Sans debogueur
+attache au client ni outil de capture reseau reel (aucun des deux
+disponible ici), impossible de voir ce que le client recoit/fait
+reellement au moment du paquet d'attaque -- meme mur que rencontre lors de
+l'investigation du dialogue [QUESTION]. Piste consideree epuisee pour
+l'instant sans meilleur outillage ; BroadcastAttack() reste actif (pas de
+regression, et correct vis-a-vis des sources meme si insuffisant) plutot
+que d'etre redesactive.
+
+================================================================================
+23. PALIER DE NIVEAU DE PERSONNAGE POUR LE CHEVAL -- TERMINE
+================================================================================
+Date: 2026-08-21 (soiree)
+
+HorseStats.cs porte desormais aussi la vraie colonne iMinLevel (25/35/50,
+donnee reelle de c_aHorseStat) via MinLevel(byte horseLevel). Applique
+uniquement dans le chemin sans argument de MountCommand.cs (/mount sans
+vnum) : refuse avec un message clair si Player.Level < HorseStats.
+MinLevel(...). C'est un gate reellement distinct du niveau 10 deja exige
+par HorseTrialQuest (celui-la donne juste acces au menu/a la quete du
+cheval, tire d'un script different - horse_ride.quest, pc.level>=10) -- un
+joueur peut terminer la quete et "posseder" HorseLevel=1 des le niveau 10,
+mais /mount refusera quand meme jusqu'au niveau 25 (voulu, correspond aux
+deux vrais gates separes du jeu original, pas un bug a corriger).
+/sethorselevel et /mount <vnum explicite> continuent tous deux de tout
+contourner, inchange -- c'est le chemin de contournement GM/test. Les bots
+montent directement via PlayerEntity.Mount() (pas via la commande
+/mount), donc non affectes par ce gate.
+
+================================================================================
+24. SPELLS DU GUERRIER -- SYSTEME COMPLET IMPLEMENTE + PLUSIEURS VRAIS BUGS
+    TROUVES ET CORRIGES (dont deux touchant la moitie des genres de classe)
+================================================================================
+Date: 2026-08-21 (soiree/nuit)
+
+UseSkillHandler etait un stub complet avant cette session (loggait un
+avertissement, ne faisait rien). Implemente un vrai evaluateur de formule
+(SkillFormula.cs) qui execute en direct les vraies formules de degats/cout/
+cooldown/duree de skilltable.txt (le serveur original les precalcule hors
+ligne dans des tables que ce depot n'a pas -- memes vrais chiffres, calcules
+a la demande a la place), branche dans PlayerSkills.Use() : verifie que le
+sort est appris/pas en cooldown/abordable, puis applique son vrai effet --
+les sorts de degats passent par le meme calcul de puissance d'attaque
+(Entity.CalculateAttackPower, nouvellement extrait de MeleeAttack sans le
+toucher) que le combat normal, les sorts de soin/buff appliquent un vrai
+bonus temporaire.
+
+Bugs reels trouves et corriges en cours de route (aucun specifique au
+nouveau code de lancement de sort en lui-meme) :
+1. EnumUtils.TryParseEnum ne faisait jamais correspondre un token de
+   fichier de donnees a un membre d'enum a l'usage de underscore different
+   (ex: "SELFONLY" de skilltable.txt vs ESkillFlags.SELF_ONLY) -- corrige
+   en comparant les deux cotes avec les underscores retires.
+2. AttackSpeed/MoveSpeed sont envoyes au client via les champs bruts de
+   CharacterUpdate/SpawnCharacter (contournant totalement GetPoint) -- un
+   bonus ajoute seulement dans GetPoint etait invisible cote client.
+   Corrige en integrant le bonus directement dans CalculateAttackSpeed()/
+   CalculateMovement(), avec une revrification periodique dans Update()
+   pour detecter l'expiration.
+3. Aucune icone de buff (barre en haut a gauche) ni effet visuel sur le
+   modele (aura d'arme) n'existaient -- les paquets HEADER_GC_AFFECT_ADD/
+   REMOVE (0x7E/0x7F) etaient absents. Ajoutes (AffectAdd.cs/AffectRemove.cs,
+   propres au joueur concerne, sans vid cible -- fidele au vrai protocole)
+   plus branche le champ bitmask Affects (deja present mais inutilise) sur
+   CharacterUpdate/SpawnCharacter pour l'effet visuel diffuse aux joueurs
+   proches.
+4. Dash (skill a fanion SPLASH) envoie TargetVid=0 depuis le client meme
+   avec un monstre cible -- confirme en direct par diagnostic. Ajoute un
+   filet de secours sur le monstre le plus proche (elargi de 200 a 600
+   unites apres un premier essai en conditions reelles toujours en echec)
+   plus de vrais degats de zone autour de la cible resolue.
+5. PlayerSkills.CanUse() avait exactement le meme bug SkillGroup.IsDefined()
+   deja corrige ailleurs dans ce fichier plus tot dans la soiree (UNKNOWN=0
+   traite comme "groupe choisi") -- rate dans cet endroit precis. Un
+   personnage frais dont le choix de branche n'aboutit jamais (/setjob
+   lance avant d'atteindre le niveau 5 minimum, qui echoue silencieusement)
+   plantait la connexion avec un IndexOutOfRangeException.
+
+SUITE IMMEDIATE, sur un personnage guerriere femme de test ("Admin2") :
+6. CanUse() indexait SkillList avec la valeur brute EPlayerClassGendered
+   (0-7) au lieu de la normaliser via .GetClass() vers EPlayerClass de base
+   (0-3) -- AssignDefaultActiveSkills() le faisait deja correctement, pas
+   cet endroit. N'importe laquelle des 4 valeurs "deuxieme moitie"
+   (WARRIOR_FEMALE=4 et au-dela) indexait hors des bornes du tableau,
+   plantant reellement la connexion sur /skillup ou /all_skills_master.
+7. IsLearnableSkill() avait la meme comparaison non normalisee -- ne
+   plantait pas (pas d'indexation de tableau) mais renvoyait toujours
+   silencieusement false pour les 4 memes genres. Les 4 premieres valeurs
+   genrees (WARRIOR_MALE=0..SHAMAN_FEMALE=3) correspondent par pure
+   coincidence numerique a EPlayerClass (0-3), les 4 autres jamais. Cela
+   signifie que SkillUp/LearnSkillByBook n'a probablement JAMAIS fonctionne
+   pour Guerriere/Ninja homme/Sura femme/Chaman homme depuis l'existence de
+   ce code -- totalement independant du travail de cette session, juste
+   jamais remarque avant qu'une guerriere femme teste le skill-up en direct
+   pour la premiere fois.
+
+Corrige en appelant .GetClass() partout, comme le seul endroit du fichier
+qui le faisait deja correctement.
+
+Egalement trouve/corrige au passage : seul le tout premier joueur jamais
+cree (Id=1, seede dans OperatorGroup via PermUser.HasData) a les
+permissions GM par defaut -- aucune commande en jeu ne permet de les
+accorder a quelqu'un d'autre. Un deuxieme personnage de test ("Admin2") a
+necessite une insertion directe en base dans PermissionUsers pour avoir
+acces GM -- attention, le GUID de PermissionGroups.Id est stocke en
+MAJUSCULES dans SQLite (comparaison TEXT sensible a la casse par defaut).
+
+================================================================================
+25. LES BOTS LANCENT DE VRAIS SORTS EN COMBAT -- IMPLEMENTE, PAS ENCORE
+    TESTE EN DIRECT
+================================================================================
+Date: 2026-08-21 (nuit)
+
+Ajoute IPlayerSkills.GetUsableActiveSkillIds() (chaque sort appris ayant un
+vrai effet exploitable dans skilltable.txt). BotPlayerEntity.LoadAsync()
+appelle desormais MasterAllUsableSkills() (meme logique que la commande GM
+/all_skills_master : SetLevel au niveau max pour chaque sort ou CanUse()
+est vrai), et UpdateCombat() a gagne TryUseSkill() -- environ toutes les 7
+secondes (cadence separee, plus longue que le cooldown d'attaque melee de
+2s, pour que les sorts se lisent comme un coup special occasionnel, pas du
+spam), choisit un sort utilisable au hasard et appelle le vrai
+PlayerSkills.Use() -- exactement le meme chemin de code qu'un vrai joueur
+via UseSkillHandler, donc un vrai effet base sur formule (degats, buff,
+aura d'arme via le bitmask Affects), pas un simulacre cosmetique.
+
+Egalement remonte le niveau des bots de 1 a 90 dans BotPlayerDataFactory --
+une reserve de mana de niveau 1 ne pouvait payer aucun sort une fois
+totalement maitrise (les formules de cout SP de skilltable.txt dependent
+de la maitrise du sort k, pas du niveau du personnage, et les bots sont
+toujours maitrises au maximum). PlayerEntity.LoadAsync() recalcule deja
+MaxHp/MaxSp/Health/Mana a partir du niveau via IJobManager, donc ce seul
+changement suffit -- rend aussi les bots nettement plus solides en melee,
+un vrai changement d'equilibrage de combat a connaitre, pas un simple
+effet de bord discret.
+
+Pas d'animation de lancer de sort visible pour les observateurs (meme
+limite que les attaques melee normales des bots -- pas de client a piloter),
+mais les vrais chiffres de degats, icones de buff et auras d'arme devraient
+tous etre visibles.
+
+================================================================================
+26. BOTS SANS MONTURE PAR DEFAUT, EQUIPEMENT NIVEAU 90, NOUVELLE MAP
+    "VOLCAN" -- FAIT, PLUS PLUSIEURS VRAIS BUGS TROUVES/CORRIGES EN ROUTE
+================================================================================
+Date: 2026-08-21/22 (nuit)
+
+Trois demandes traitees ensemble :
+
+1. Bots plus jamais montes par defaut. BotPlayerEntity.LoadAsync() n'appelle
+   plus Mount(HorseVnums.ForLevel(...)) -- Player.HorseLevel reste inchange,
+   /mount fonctionne toujours pour qui veut tester la monture, seul le
+   comportement PAR DEFAUT des bots a change.
+
+2. Equipement niveau 90 par classe (au lieu du set niveau 0 de depart).
+   Chaque item verifie individuellement via ses AntiFlags reels dans
+   item_proto (meme methode que le fix "starter gear" de la session
+   precedente) :
+   - Guerrier : Triton Sword+9 (id 279, lvl90) / Blue Steel Armour+9
+     (id 12019, lvl90) / War Master Helmet+9 (id 12289, lvl80)
+   - Ninja : Soulless Knife+9 (id 4049, lvl90) / Blue Dragon Suit+9
+     (id 12029, lvl90) / Spider Hood+9 (id 12409, lvl80)
+   - Sura : Edge Blade+9 (id 209, lvl90) / Aura Plate Armour+9 (id 12039,
+     lvl90) / Magic Helmet+9 (id 12549, lvl80)
+   - Chaman : Dragon Jaw Bell+9 (id 5339, lvl90) / Dragon Clothing+9
+     (id 12049, lvl90) / Soul Shard Hat+9 (id 12689, lvl80)
+   Aucun casque niveau 90 exact n'existe dans ce jeu de donnees (ils
+   plafonnent a lvl80 en +9) -- sans importance, la limite de niveau d'un
+   item est un PLANCHER, pas une correspondance exacte, donc un bot niveau
+   90 les porte sans probleme.
+
+3. Nouvelle map "volcan" avec les vrais metins niveau 70. Identifiee via
+   les vraies donnees : "70 metins" = les pierres-metin de cette map sont
+   le mob vnum 8014, TYPE=STONE RANK=KING LEVEL=70 dans le vrai
+   mob_proto.txt -- pas un compte de 70 pierres (il n'y en a que 4 sur
+   cette map). C'est metin2_map_n_flame_01 (le "Volcano" retail). Donnees
+   serveur reelles (Setting.txt/Town.txt/npc.txt/regen.txt/boss.txt/
+   stone.txt/server_attr) copiees depuis la source serveur originale dans
+   data/maps/metin2_map_n_flame_01/, enregistree dans atlasinfo.txt et
+   dans la liste "maps" d'appsettings.json exactement comme a1/b1/c1.
+   BasePosition/MapSize repris tels quels depuis le vrai Setting.txt --
+   verifie qu'ils ne chevauchent aucune des trois maps existantes.
+
+Plusieurs vrais bugs trouves et corriges en testant ce dernier point en
+direct :
+
+a. npc.txt importe tel quel depuis la source originale avait UNE ligne
+   avec un artefact d'espacement ("60  " -- deux espaces avant une
+   tabulation) qui faisait planter le serveur au demarrage :
+   ParserService.GetSpawnFromLine utilise un regex de split
+   "(?: {2,}|\t+)" -- deux espaces consecutifs suivis immediatement d'une
+   tabulation forment DEUX correspondances adjacentes sans rien entre les
+   deux, ce qui produit une chaine vide dans le tableau decoupe, et
+   int.Parse("") leve un FormatException juste apres le demarrage
+   (System.FormatException: The input string '' was not in a correct
+   format, dans SpawnPointProvider.AddSpawnPointsFromFileAsync ->
+   ParserService.GetSpawnFromLine). Corrige en normalisant tous les
+   separateurs de npc.txt en une seule tabulation (les 3 autres fichiers
+   du dossier -- regen.txt/stone.txt/boss.txt -- etaient deja propres).
+
+b. PlayerEntity.Warp() (utilise par /goto quand la destination est en
+   dehors des limites de la map courante) ne persistait JAMAIS la nouvelle
+   position en base avant de deconnecter le client pour le reconnecter
+   ailleurs. GameConnection.OnCloseAsync ne persiste que sur une
+   deconnexion INATTENDUE (expected=false) -- la reconnexion déclenchée
+   par le paquet Warp est une fermeture volontaire cote client
+   (expected=true), qui suit le meme chemin non-persistant que Warp()
+   utilise deja lui-meme pour se retirer de la map. Resultat confirme en
+   direct : "/goto -m n_flame_01" semblait juste "recharger le jeu" et
+   renvoyait le joueur sur metin2_map_c1 (sa derniere position VRAIMENT
+   sauvegardee). Corrige en appelant PersistAsync() (fire-and-forget,
+   meme convention que Connection.Close()) des que la nouvelle position
+   est fixee, avant le despawn.
+
+c. GotoCommand utilisait le centre geometrique brut de la boite englobante
+   de la map cible (todo deja present dans le code) comme destination
+   quand on donne juste -m <map> sans x/y -- un point totalement
+   arbitraire, sans aucune garantie d'etre praticable. Confirme en direct
+   : le joueur s'est retrouve coince sur un rocher, incapable de bouger.
+   Premiere correction : utiliser le vrai point de spawn de la map
+   (Town.txt, deja parse dans Map.TownCoordinates) selon l'empire du
+   joueur au lieu du centre. Mais le VRAI point de spawn Jinno du Town.txt
+   original de cette map se trouve justement pile sur un rocher
+   impraticable (coincidence : il se trouve pres du centre geometrique de
+   la map). PlayerEntity.Move() protege deja les deplacements LOCAUX
+   (meme map) contre une destination BLOCK/OBJECT, mais Warp() (utilise
+   pour les sauts inter-map) ne verifie RIEN du tout -- teleportation
+   aveugle. Corrige en ajoutant une recherche en anneaux croissants
+   (pas de 1m, jusqu'a 30m) autour de la destination choisie pour trouver
+   la cellule praticable la plus proche avant d'appeler Move().
+
+d. Regression du gel d'animation d'attaque des bots (bug historique deja
+   documente dans bot-feature-overview, precedemment considere "regle" sur
+   les maps de depart apres le fix Stop()/BroadcastStop()) -- confirme en
+   direct sur n_flame_01 : le bot se figeait completement (plus aucune
+   animation, meme pas de marche) des sa toute premiere attaque. Cause
+   exacte non isolee (terrain/donnees de hauteur de la nouvelle map,
+   plusieurs autres changements simultanes -- equipement, monture par
+   defaut -- rendent l'isolement incertain sans outillage de debug client,
+   deja signale comme piste epuisee dans la session precedente). Revert au
+   comportement historique sur : BroadcastAttack() desactive de nouveau
+   (aucun paquet ATTACK/COMBO envoye), les degats continuent de
+   s'appliquer normalement via Entity.Damage(). Confirme en direct par
+   l'utilisateur apres redeploiement : les bots marchent et attaquent a
+   nouveau normalement (juste "lentement" -- AttackCooldown=2s, valeur
+   deliberee, pas un bug), plus de blocage, toujours pas d'animation de
+   coup visible (limite deja connue et documentee, jamais resolue).
+
+================================================================================
+27. SESSION AUTONOME DE NUIT -- DEGATS, VIT/DEFENSE/PV, COOLDOWNS DE SORTS :
+    PLUSIEURS VRAIS BUGS TROUVES ET CORRIGES, DOCUMENTE SANS RETOUR EN DIRECT
+================================================================================
+Date: 2026-08-22 (nuit, session autonome -- utilisateur endormi, "fait ce qu'il
+faut et documente a la fin")
+
+L'utilisateur a signale trois problemes avant d'aller dormir : (1) les degats
+de combat semblaient beaucoup trop bas par rapport aux stats affichees,
+(2) le cooldown d'Aura du Sabre semblait durer environ 3 minutes au lieu des
+environ 95 secondes attendues, (3) une re-apparition du bug de position "en
+arriere" apres reconnexion. Tout ce qui suit a ete verifie via les vraies
+donnees du jeu (fichiers client/serveur originaux) plutot que devine, et
+redeploye/verifie stable (demarrage propre, aucune nouvelle erreur), mais
+SANS retour en direct de l'utilisateur puisqu'il etait deconnecte -- a
+re-tester a son reveil.
+
+--------------------------------------------------------------------------
+27a. VRAI BUG TROUVE : ATTACK_GRADE ne recevait jamais de valeur de base
+--------------------------------------------------------------------------
+Diagnostic en direct (log de debug temporaire mirrorant SendDebugDamage, qui
+existait deja dans le code mais n'ecrivait qu'au chat, jamais au log serveur)
+a confirme : pour un guerrier niveau 90 avec environ 250 STR, la valeur
+"attack" reelle cote serveur avant mitigation par la defense n'etait que
+d'environ 450-500, alors que meme apres soustraction de la defense de la
+cible (environ 175), les degats observes (260-330) etaient
+MATHEMATIQUEMENT COHERENTS avec la formule -- le vrai probleme etait en
+amont : le point ATTACK_GRADE (qui alimente directement le calcul de degats
+en melee, Entity.MeleeAttack()) etait code pour ne jamais inclure de valeur
+de base, seulement un eventuel buff de sort actif (Aura du Sabre). Sans buff
+actif, ATTACK_GRADE valait toujours 0, peu importe la force du personnage.
+
+Verifie contre le vrai code source du serveur original
+(CHARACTER::ComputePoints(), char.cpp) : la vraie formule est
+iAtk = niveau*2 + iStatAtk, ou iStatAtk depend de la classe :
+- Guerrier/Sura : 2 fois STR
+- Ninja (Assassin) : (4 fois STR + 2 fois DEX) / 3
+- Chaman : (4 fois STR + 2 fois INT) / 3
+
+Ce repo avait deja une methode CalculateAttackDamage() qui tentait de
+modeliser un concept similaire via Job.AttackStatus, mais (a) la formule ne
+correspond pas exactement a celle-ci, (b) AttackStatus n'est configure nulle
+part (aucune entree job.txt/config ne le definit, confirme par recherche
+exhaustive), et (c) la methode entiere n'est appelee nulle part dans le
+pipeline de combat reel -- code mort depuis le debut. Plutot que de reparer
+cette voie existante mais mal cablee, la vraie formule a ete codee
+directement dans une nouvelle methode GetBaseAttackGrade() (PlayerEntity.cs),
+utilisee par le cas EPoint.ATTACK_GRADE de GetPoint().
+
+Confirme en direct par l'utilisateur apres redeploiement : degats nettement
+plus eleves, ressenti correct meme si toujours legerement bas. (Le residu
+restant est probablement du a des composantes reelles non modelisees ici --
+bonus de monture/objets sur ATT_GRADE -- mais le gros du trou etait cette
+base manquante.)
+
+--------------------------------------------------------------------------
+27b. Rappel : VIT ne mettait pas a jour PV max / Defense, deja corrige et
+     confirme plus tot dans la soiree (AddPoint() sur HT/IQ et LevelUp() ne
+     recalculaient jamais Player.MaxHp/MaxSp/_defence, calcules une seule
+     fois a la connexion). Corrige : recalcul immediat apres modification.
+     Confirme en direct par l'utilisateur.
+--------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+27c. COOLDOWNS DE SORTS -- CAUSE RACINE TROUVEE : le fichier skilltable.txt
+     serveur divergeait du fichier skilltable.txt reel embarque dans le
+     client (52 sorts sur 77 avaient des formules differentes)
+--------------------------------------------------------------------------
+Diagnostic en direct (meme technique : log de debug temporaire mirrorant les
+messages deja envoyes au chat par le code existant) a confirme que le
+serveur calculait et appliquait correctement un cooldown de 40 secondes pour
+Aura du Sabre au niveau de maitrise max (formule "30+10*k" du skilltable.txt
+de ce repo) -- et qu'aucune tentative de re-cast n'a jamais ete envoyee par
+le client pendant les environ 3 minutes d'attente ressenties (aucune ligne
+de refus dans le log). Ceci pointait fortement vers un mecanisme cote client
+independant du serveur.
+
+Confirme en lisant le vrai code source C++ du client
+(ClientVS22/source/UserInterface/PythonPlayerSkill.cpp et PythonSkill.cpp) :
+le client calcule et demarre sa propre animation de cooldown localement,
+immediatement a l'usage du sort (methode RunCoolTime qui appelle
+GetSkillCoolTime), en utilisant sa propre copie du fichier skilltable.txt
+(chargee via TextFileLoader) -- aucun paquet serveur n'est implique dans ce
+calcul precis. Un paquet dedie existe bien dans le vrai protocole
+(HEADER_GC_SKILL_COOLTIME_END, header 73, jamais implemente dans ce repo),
+mais il ne sert qu'a notifier une fin de cooldown anticipee (ex: objet ou
+effet qui annule un cooldown), pas le decompte normal.
+
+Ceci confirmait que rien cote serveur ne peut changer l'animation visuelle
+de cooldown -- sauf que le client embarque, lui aussi, un vrai fichier
+skilltable.txt en clair : Client/Eternexus/locale_en/locale/en/skilltable.txt
+(et les autres locales). Comparaison directe (colonnes formules, en ignorant
+la colonne nom coreen dont l'encodage differe cosmetiquement) entre ce
+fichier client et le fichier serveur de ce repo :
+
+52 sorts sur 77 avaient des formules differentes. Exemple concret,
+Aura du Sabre (id 4) :
+- CooldownPoly : serveur "30+10*k" (40s au niveau max) contre client
+  "33+50*k" (83s au niveau max) -- valeurs completement differentes, pas
+  juste un arrondi.
+- MasterBonusPoly : serveur dupliquait PointPoly, client le laisse vide.
+
+Meme motif retrouve sur Berserker Fury (id 3) et Force Interieure / Strong
+Body (id 19) -- CooldownPoly serveur "63+10*k" (73s) contre client
+"63+90*k" (153s) pour les deux. Fait interessant : les degats, couts et
+durees de tous les sorts deja testes en direct cette session (Coupe Triple,
+Tourbillon, Ruee alias Dash, Aura, Berserker Fury, Force Interieure)
+etaient identiques entre les deux fichiers sur leurs formules de degats,
+cout et duree -- seule la formule de cooldown des sorts de type buff (pas
+les sorts de degats purs) divergeait, et systematiquement dans le sens
+"trop court" sur le fichier serveur. Ceci confirme que le nombre "environ 95
+secondes" dont se souvenait l'utilisateur pour Aura est bien plus proche de
+la vraie valeur (83s calcule depuis le fichier client) que des 40s que ce
+repo calculait avant -- et confirme aussi qu'il n'y avait pas de bug
+d'implementation du cote de ce repo pour Dash, Aura ou les autres, juste des
+donnees de depart incorrectes ou desynchronisees du vrai jeu.
+
+Correction appliquee : le fichier Executables/Single/data/skilltable.txt de
+ce repo a ete remplace par la copie authentique du client
+(Client/Eternexus/locale_en/locale/en/skilltable.txt), la seule copie
+directement verifiable comme etant celle que le jeu reel utilise reellement.
+Sauvegarde de l'ancien fichier conservee temporairement dans le scratchpad
+au cas ou une regression serait constatee. Verifie apres redeploiement :
+"Loaded 70 skills" (meme nombre qu'avant, les 7 memes entrees de sorts de
+monstres deja invalides avant ce changement -- ids 256 a 262, sans lien avec
+les sorts de joueur -- restent invalides de la meme facon, aucune
+regression). Toutes les formules de degats, cout et duree des sorts deja
+testes en direct cette session sont restees identiques -- seuls les
+cooldowns des sorts de type buff ont change (rallonge), donc aucun risque de
+regression sur les degats/effets deja confirmes fonctionnels.
+
+Non teste en direct (utilisateur deconnecte) : le ressenti reel du cooldown
+d'Aura apres ce changement. A confirmer a la prochaine session -- si le
+decompte visuel du client correspond maintenant a environ 83s au lieu
+d'environ 180s, cela confirme totalement le diagnostic ; sinon, il restera a
+determiner si le client utilise une autre copie locale (le patch client
+pourrait suivre une version legerement differente de celle inspectee ici)
+ou un mecanisme supplementaire non identifie.
+
+--------------------------------------------------------------------------
+27d. VRAI BUG TROUVE ET CORRIGE : persistance de position en course avec une
+     ecriture DB concurrente plus ancienne
+--------------------------------------------------------------------------
+Le correctif de PlayerEntity.Warp() de plus tot dans la soiree (persister la
+position avant de deconnecter le client pour un saut inter-map) utilisait un
+appel fire-and-forget (sans attendre sa completion). Sans attente explicite,
+rien ne garantit qu'il se termine avant un appel de persistance ULTERIEUR et
+sans rapport (ex : un /shutdown quelques secondes plus tard) -- si le
+deuxieme appel (plus recent, position correcte) se termine avant le premier
+(plus ancien, fire-and-forget, position perimee), le second ecrase le
+resultat du premier avec une valeur perimee. Confirme en direct :
+l'utilisateur s'est retrouve reconnecte sur "une position precedente, mais
+pas la derniere" -- exactement le symptome attendu d'une telle course.
+
+Corrige en rendant cet appel bloquant (attente synchrone explicite, avec
+suppression ciblee de l'avertissement d'analyseur correspondant -- meme
+motif deja utilise ailleurs dans World.cs pour une raison similaire) plutot
+que de rendre Warp()/Move() asynchrones (ce qui aurait necessite de modifier
+la signature de IEntity.Move et tous ses appelants). Une teleportation
+inter-map est une operation rare, pas un chemin critique en frequence, donc
+un court blocage est un compromis acceptable pour garantir l'ordre des
+ecritures.
+
+--------------------------------------------------------------------------
+Nettoyage : tout le logging de diagnostic temporaire ajoute cette nuit a ete
+retire du code avant le redeploiement final, suivant la convention etablie
+cette session.
+--------------------------------------------------------------------------
+
+================================================================================
+28. LES MESSAGES DE DEBUG DE DEGATS PAR COUP SONT DESORMAIS DESACTIVES
+    PAR DEFAUT (bascule via /debug_damage)
+================================================================================
+Date: 2026-08-22 (matin, apres le reveil de l'utilisateur)
+
+Entity.cs contient depuis un moment une methode SendDebugDamage() appelee a
+chaque coup porte ou recu (attaque normale ou sort) -- elle envoie une ligne
+de chat detaillee ("Base Attack value", "With bonus and level", "Base
+defence", "Melee damage"...) a l'attaquant ET a la victime si l'un des deux
+est un joueur reel. C'est exactement ce mecanisme qui a servi cette nuit a
+diagnostiquer le vrai bug ATTACK_GRADE (section 27a) -- mais il tournait de
+facon INCONDITIONNELLE, polluant le chat normal a chaque coup, en combat
+comme en etant attaque.
+
+Demande explicite de l'utilisateur ce matin : retirer ces messages. Plutot
+que de supprimer le mecanisme (utile, vient de prouver sa valeur cette nuit
+meme), il a ete rendu desactivable :
+- Nouvelle propriete PlayerEntity.DebugDamageEnabled (bool, false par
+  defaut).
+- Entity.SendDebugDamage() ne parle desormais au chat que si
+  DebugDamageEnabled est vrai, cote attaquant ET cote victime
+  independamment.
+- La commande /debug_damage (Commands/DebugCommand.cs), qui affichait deja
+  un instantane ponctuel des degats d'arme/attaque, bascule maintenant
+  EGALEMENT ce flag (on/off) en plus de son affichage existant, avec un
+  message de confirmation ("Per-hit damage breakdown enabled/disabled.").
+
+Comportement par defaut desormais silencieux en jeu normal ; reactivable a
+la volee via /debug_damage pour une future session de diagnostic sans
+modifier a nouveau le code.
+
+================================================================================
+29. REGRESSION APRES LE REMPLACEMENT DE SKILLTABLE.TXT : AURA ET BERSERKER
+    AVAIENT PERDU LEUR AURA/ICONE DE BUFF -- VRAI BUG DE PARSING TROUVE ET
+    CORRIGE
+================================================================================
+Date: 2026-08-22 (matin)
+
+Suite au remplacement de skilltable.txt par la vraie copie du client
+(section 27c), l'utilisateur a signale : plus d'aura autour de l'arme, plus
+d'icone de buff en haut a gauche, pour Aura du Sabre ET Berserker Fury.
+
+Cause : le fichier client encode les colonnes AffectFlag/AffectFlag2 en
+INDEX DE BIT NUMERIQUE (ex: "15" pour Aura) alors que l'ancien fichier de ce
+repo utilisait des NOMS TEXTE lisibles (ex: "GEOMGYEONG"). Confirme par
+correspondance exacte : EAffectFlags.GEOMGYEONG = 1 << 15, JEONGWIHON =
+1 << 14, CHEONGEUN = 1 << 16 -- les nombres du fichier client (14/15/16)
+correspondent pile aux montants de decalage de bit de ces memes noms. La
+fonction ParserService.ExtractAffectFlags() ne savait faire correspondre
+que des NOMS d'enum (via EnumUtils.TryParseEnum), donc chaque valeur
+numerique echouait silencieusement (aucune correspondance de nom trouvee) et
+le flag retombait a 0 -- 15 sorts sur 77 sont concernes (au moins un sort
+actif buff par classe/branche), pas seulement Aura et Berserker.
+
+Important a noter : le BONUS DE STAT lui-meme (vitesse d'attaque, defense,
+etc.) continuait de s'appliquer normalement cote serveur -- seul le paquet
+AffectAdd envoye au client avec Flag=0 empechait l'icone de buff et l'aura
+visuelle de s'afficher, purement cosmetique mais evidemment tres genant
+pour juger si un sort "marche".
+
+Corrige : ExtractAffectFlags() essaie maintenant de parser la valeur comme
+un entier d'abord (traite alors comme un index de bit, `1 << N`), et ne
+retombe sur la correspondance par nom que si ce n'est pas un nombre. "0" est
+traite comme NONE (pas comme le bit 0/YMIR) par securite. Confirme en
+direct par l'utilisateur apres redeploiement : "the buff and aura are back."
+
+================================================================================
+30. BONUS DE DEGATS "PLACEHOLDER" CONTRE LES MONSTRES -- fonction
+    CalculateAttackBonus() etait un no-op complet (todo jamais fait)
+================================================================================
+Date: 2026-08-22 (matin)
+
+L'utilisateur a fourni un point de comparaison concret : un personnage
+niveau 55 boost sur un vrai serveur officiel (video de 2010) tapait un
+metin pour 1500 dommages, alors qu'Admin (niveau 99, 249 STR, arme deux
+mains "75+9") ne tape qu'environ 800 -- meme apres la correction ATTACK_GRADE
+de cette nuit (section 27a).
+
+Verifie contre le vrai CalcMeleeDamage()/CalcAttBonus() (battle.cpp,
+source serveur original) : la structure de formule de ce repo correspond
+EXACTEMENT au vrai code (meme calcul de degats d'arme, meme attackRating,
+meme ordre d'operations) -- sauf un morceau completement absent :
+Entity.CalculateAttackBonus() est un no-op integral, avec des commentaires
+"todo implement bonus attack against animals etc..." jamais traites. Le
+vrai CalcAttBonus() applique plusieurs bonus en POURCENTAGE a ce niveau,
+notamment POINT_ATTBONUS_MONSTER (bonus general contre tout ce qui n'est
+pas un joueur, metins inclus) et des bonus specifiques par race
+(animal/mort-vivant/humain/etc.).
+
+Probleme de fond : dans le vrai jeu, ces pourcentages proviennent des
+ATTRIBUTS D'OBJETS (affixes aleatoires sur l'equipement, ex: "+15% degats
+contre les monstres") -- un systeme ENTIER absent de ce repo (chaque objet
+ici est un proto statique fixe, aucune valeur d'attribut par instance
+n'existe nulle part dans le code). Le joueur de la video avait tres
+probablement plusieurs de ces bonus cumules sur son equipement reel, jamais
+modelisable ici sans construire tout ce sous-systeme.
+
+Decision de l'utilisateur (question posee explicitement) : plutot que de
+laisser ce trou tel quel OU de construire le systeme d'attributs complet,
+implementer un bonus fixe ("placeholder") pour tester rapidement. Applique :
+CalculateAttackBonus() ajoute desormais +20% de degats quand la cible n'est
+PAS un joueur (MONSTER/METIN_STONE/NPC/etc., toute cible non-PLAYER et
+non-POLYMORPH_PLAYER) -- une constante codee en dur
+(PlaceholderMonsterDamageBonusPercent = 20), PAS une vraie donnee par objet,
+documentee comme telle dans le code, a remplacer si un jour un vrai systeme
+d'attributs existe (GetPoint(EPoint.ATTBONUS_MONSTER) reel).
+
+Non teste en direct au moment de la redaction -- +20% seul ne comblera
+probablement pas tout l'ecart avec les 1500 degats de la video (l'utilisateur
+a lui-meme reconnu "there are multiple issues to resolve"), a retester et
+ajuster.

@@ -1,0 +1,5 @@
+metin2_map_a1	409600	896000	4	5
+metin2_map_b1	0	102400	4	5
+metin2_map_c1	921600	204800	4	5
+metin2_map_n_flame_01	588800	614400	6	6
+metin2_map_n_snowm_01	358400	153600	6	6

@@ -1,0 +1,8 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<Project ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ImportGroup Condition=" '$(ExcludeRestorePackageImports)' != 'true' ">
+    <Import Project="$(NuGetPackageRoot)microsoft.visualstudio.threading.analyzers\18.7.23\buildTransitive\Microsoft.VisualStudio.Threading.Analyzers.targets" Condition="Exists('$(NuGetPackageRoot)microsoft.visualstudio.threading.analyzers\18.7.23\buildTransitive\Microsoft.VisualStudio.Threading.Analyzers.targets')" />
+    <Import Project="$(NuGetPackageRoot)microsoft.extensions.telemetry.abstractions\10.9.0\buildTransitive\net8.0\Microsoft.Extensions.Telemetry.Abstractions.targets" Condition="Exists('$(NuGetPackageRoot)microsoft.extensions.telemetry.abstractions\10.9.0\buildTransitive\net8.0\Microsoft.Extensions.Telemetry.Abstractions.targets')" />
+    <Import Project="$(NuGetPackageRoot)microsoft.extensions.http.resilience\10.9.0\buildTransitive\net8.0\Microsoft.Extensions.Http.Resilience.targets" Condition="Exists('$(NuGetPackageRoot)microsoft.extensions.http.resilience\10.9.0\buildTransitive\net8.0\Microsoft.Extensions.Http.Resilience.targets')" />
+  </ImportGroup>
+</Project>

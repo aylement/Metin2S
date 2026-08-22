@@ -1,0 +1,17 @@
+﻿using QuantumCore.API.Game.Types.Items;
+using QuantumCore.Networking;
+
+namespace QuantumCore.API.Packets;
+
+[Packet(0x14, EDirection.INCOMING, Sequence = true)]
+[PacketGenerator]
+public partial class ItemDrop
+{
+    [Field(0)] public WindowType Window { get; set; }
+
+    [Field(1)] public ushort Position { get; set; }
+
+    [Field(2)] public uint Gold { get; set; }
+
+    [Field(3)] public byte Count { get; set; }
+}

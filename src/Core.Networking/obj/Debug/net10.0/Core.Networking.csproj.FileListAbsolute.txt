@@ -1,0 +1,13 @@
+F:\GitHub\quantum-core-x\src\Core.Networking\bin\Debug\net10.0\Core.Networking.deps.json
+F:\GitHub\quantum-core-x\src\Core.Networking\bin\Debug\net10.0\Core.Networking.dll
+F:\GitHub\quantum-core-x\src\Core.Networking\bin\Debug\net10.0\Core.Networking.pdb
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.csproj.AssemblyReference.cache
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.GeneratedMSBuildEditorConfig.editorconfig
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.AssemblyInfoInputs.cache
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.AssemblyInfo.cs
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.csproj.CoreCompileInputs.cache
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.sourcelink.json
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.dll
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\refint\Core.Networking.dll
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\Core.Networking.pdb
+F:\GitHub\quantum-core-x\src\Core.Networking\obj\Debug\net10.0\ref\Core.Networking.dll

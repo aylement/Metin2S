@@ -1,0 +1,220 @@
+using AwesomeAssertions;
+using Core.Tests.Extensions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Time.Testing;
+using NSubstitute;
+using QuantumCore;
+using QuantumCore.API;
+using QuantumCore.API.Core.Models;
+using QuantumCore.API.Core.Timekeeping;
+using QuantumCore.API.Game.Types.Monsters;
+using QuantumCore.API.Game.World;
+using QuantumCore.Core.Event;
+using QuantumCore.Game;
+using QuantumCore.Game.Services;
+using QuantumCore.Game.World;
+using QuantumCore.Game.World.Entities;
+using QuantumCore.Networking;
+using Xunit;
+
+namespace Core.Tests;
+
+public class MapTests
+{
+    private SpawnPoint[] _spawnPoints = [];
+    private readonly FakeTimeProvider _timeProvider = new();
+    private readonly ServerClock _clock;
+    private readonly Map _map;
+    private readonly IWorld _world;
+    private readonly GameServer _gameServer;
+
+    public MapTests()
+    {
+        var npcShopProvider = Substitute.For<INpcShopProvider>();
+        npcShopProvider.Shops.Returns([]);
+        var provider = new ServiceCollection()
+            .AddKeyedSingleton<IPacketManager>(HostingOptions.MODE_GAME, (_, _) => Substitute.For<IPacketManager>())
+            .AddSingleton(Substitute.For<ICommandManager>())
+            .AddSingleton<IMonsterManager>(_ =>
+            {
+                var mock = Substitute.For<IMonsterManager>();
+                mock.GetMonster(Arg.Any<uint>()).Returns(call => new MonsterData
+                {
+                    Id = call.Arg<uint>(), TranslatedName = "TestMonster"
+                });
+                return mock;
+            })
+            .AddSingleton(Substitute.For<IAnimationManager>())
+            .AddSingleton<ICacheManager>(_ =>
+            {
+                var mock = Substitute.For<ICacheManager>();
+                mock.Subscribe().Returns(Substitute.For<IRedisSubscriber>());
+                mock.KeysAsync(Arg.Any<string>()).Returns(_ => []);
+                return mock;
+            })
+            .AddSingleton(npcShopProvider)
+            .AddSingleton(Substitute.For<IServerBase>())
+            .AddSingleton(Substitute.For<IItemManager>())
+            .AddSingleton(Substitute.For<IDropProvider>())
+            .AddSingleton(Substitute.For<IMapAttributeProvider>())
+            .AddSingleton<PluginExecutor>()
+            .AddSingleton<IAtlasProvider>(_ =>
+            {
+                var mock = Substitute.For<IAtlasProvider>();
+                mock.GetAsync(Arg.Any<IWorld>()).Returns(_ => [_map!]);
+                return mock;
+            })
+            .AddSingleton<TimeProvider>(_ => _timeProvider)
+            .AddSingleton<ServerClock>(_ => new ServerClock(_timeProvider))
+            .AddSingleton<IConfiguration>(_ => new ConfigurationBuilder().Build())
+            .AddSingleton<ISpawnGroupProvider>(_ =>
+            {
+                var mock = Substitute.For<ISpawnGroupProvider>();
+                mock.GetSpawnGroupsAsync().Returns(_ =>
+                [
+                    new SpawnGroup
+                    {
+                        Id = 101,
+                        Name = "TestGroup1",
+                        Leader = 101,
+                        Members = [new SpawnMember { Id = 101 }, new SpawnMember { Id = 101 }]
+                    }
+                ]);
+                mock.GetSpawnGroupCollectionsAsync().Returns(_ =>
+                [
+                    // equal items but only one will be spawned
+                    new SpawnGroupCollection
+                    {
+                        Id = 101,
+                        Name = "TestGroupCollection",
+                        Groups = [new SpawnGroupCollectionMember { Id = 101, Probability = 1 }]
+                    },
+                    new SpawnGroupCollection
+                    {
+                        Id = 101,
+                        Name = "TestGroupCollection",
+                        Groups = [new SpawnGroupCollectionMember { Id = 101, Probability = 1 }]
+                    }
+                ]);
+                return mock;
+            })
+            .AddSingleton<IWorld, World>()
+            .AddSingleton<ISpawnPointProvider>(_ =>
+            {
+                var mock = Substitute.For<ISpawnPointProvider>();
+                mock.GetSpawnPointsForMapAsync(Arg.Any<string>()).Returns(_ => Task.FromResult(_spawnPoints));
+                return mock;
+            })
+            .AddOptions<HostingOptions>(HostingOptions.MODE_GAME)
+            .Configure(options =>
+            {
+                options.Port = 0;
+                options.IpAddress = "127.0.0.1";
+            })
+            .Services
+            .AddOptions<HostingOptions>().Services
+            .AddQuantumCoreTestLogger()
+            .BuildServiceProvider();
+        _clock = provider.GetRequiredService<ServerClock>();
+        _gameServer = ActivatorUtilities.CreateInstance<GameServer>(provider);
+        var monsterManager = provider.GetRequiredService<IMonsterManager>();
+        var animationManager = provider.GetRequiredService<IAnimationManager>();
+        var cacheManager = provider.GetRequiredService<ICacheManager>();
+        var spawnPointProvider = provider.GetRequiredService<ISpawnPointProvider>();
+        var attributeProvider = provider.GetRequiredService<IMapAttributeProvider>();
+        var dropProvider = provider.GetRequiredService<IDropProvider>();
+        var server = provider.GetRequiredService<IServerBase>();
+        server.Clock.Returns(_clock);
+        var logger = provider.GetRequiredService<ILogger<MapTests>>();
+        _world = provider.GetRequiredService<IWorld>();
+        _map = new Map(monsterManager, animationManager, cacheManager, _world, logger, spawnPointProvider,
+            attributeProvider, dropProvider, server,
+            "Test", new Coordinates(), 4096, 4096, null, provider);
+    }
+
+    [Fact]
+    public async Task Spawn_SingleEntityAsync()
+    {
+        _spawnPoints =
+        [
+            new SpawnPoint
+            {
+                Type = ESpawnPointType.MONSTER,
+                Monster = 101,
+                X = 500,
+                Y = 500,
+                RespawnTime = 0,
+            }
+        ];
+        await _world.LoadAsync(TestContext.Current.CancellationToken);
+        await _world.InitAsync();
+        var ctx = Tick();
+        EventSystem.Update(ctx);
+        _world.Update(ctx); // spawn entities
+
+        _map.Entities.Should().HaveCount(1);
+        var entity = _map.Entities.ElementAt(0);
+        var mob = entity.Should().BeOfType<MonsterEntity>().Subject;
+        mob.Proto.Id.Should().Be(101);
+    }
+
+    [Fact]
+    public async Task Spawn_GroupAsync()
+    {
+        _spawnPoints =
+        [
+            new SpawnPoint
+            {
+                Type = ESpawnPointType.GROUP,
+                Monster = 101,
+                X = 500,
+                Y = 500,
+                RespawnTime = 0,
+            }
+        ];
+        await _world.LoadAsync(TestContext.Current.CancellationToken);
+        await _world.InitAsync();
+        var ctx = Tick();
+        EventSystem.Update(ctx);
+        _world.Update(ctx); // spawn entities
+
+        _map.Entities.Should().HaveCount(3);
+        var mobs = _map.Entities.Should().AllBeOfType<MonsterEntity>().Subject;
+        mobs.Should().AllSatisfy(x => x.Proto.Id.Should().Be(101));
+    }
+
+    [Fact]
+    public async Task Spawn_GroupCollectionAsync()
+    {
+        _spawnPoints =
+        [
+            new SpawnPoint
+            {
+                Type = ESpawnPointType.GROUP_COLLECTION,
+                Monster = 101,
+                X = 500,
+                Y = 500,
+                RespawnTime = 0,
+            }
+        ];
+        await _world.LoadAsync(TestContext.Current.CancellationToken);
+        await _world.InitAsync();
+        var ctx = Tick();
+        EventSystem.Update(ctx);
+        _world.Update(ctx); // spawn entities
+
+        _map.Entities.Should().HaveCount(3);
+        var mobs = _map.Entities.Should().AllBeOfType<MonsterEntity>().Subject;
+        mobs.Should().AllSatisfy(x => x.Proto.Id.Should().Be(101));
+    }
+
+    private TickContext Tick(double elapsedMilliseconds = 0)
+    {
+        var delta = TimeSpan.FromMilliseconds(elapsedMilliseconds);
+        _timeProvider.Advance(delta);
+        var now = _clock.Now;
+        return new TickContext(_clock, delta, now);
+    }
+}

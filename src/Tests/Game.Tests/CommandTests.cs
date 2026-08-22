@@ -1,0 +1,872 @@
+using System.Net;
+using System.Text;
+using AutoBogus;
+using AwesomeAssertions;
+using AwesomeAssertions.Equivalency;
+using Bogus;
+using Game.Tests.Extensions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
+using NSubstitute;
+using QuantumCore.API;
+using QuantumCore.API.Core.Models;
+using QuantumCore.API.Core.Timekeeping;
+using QuantumCore.API.Game;
+using QuantumCore.API.Game.Guild;
+using QuantumCore.API.Game.Types;
+using QuantumCore.API.Game.Types.Entities;
+using QuantumCore.API.Game.Types.Items;
+using QuantumCore.API.Game.Types.Players;
+using QuantumCore.API.Game.Types.Skills;
+using QuantumCore.API.Game.World;
+using QuantumCore.API.Packets;
+using QuantumCore.API.Packets.Skills;
+using QuantumCore.Core.Packets;
+using QuantumCore.Extensions;
+using QuantumCore.Game.Commands;
+using QuantumCore.Game.Extensions;
+using QuantumCore.Game.Persistence;
+using QuantumCore.Game.Persistence.Entities;
+using QuantumCore.Game.World;
+using QuantumCore.Game.World.Entities;
+using QuantumCore.Networking;
+using Weikio.PluginFramework.Catalogs;
+
+// cannot cast MockedGameConnection to IGameConnection ???
+#pragma warning disable CS8602
+
+namespace Game.Tests;
+
+// Custom mock instead of Mock<T> because IPacketSerializable for IGameConnection.Send<T> cannot be used as generic
+// parameter
+internal sealed class MockedGameConnection : IGameConnection
+{
+    public readonly List<ChatOutcoming> SentMessages = [];
+    public readonly List<GcPhase> SentPhases = [];
+    public readonly List<object> SentPackets = [];
+    public Guid Id { get; }
+    public EPhase Phase { get; set; }
+    public Task ExecuteTask { get; } = null!;
+
+    public void Close(bool expected = true)
+    {
+    }
+
+    public void Send<T>(T packet) where T : IPacketSerializable
+    {
+        // ReSharper disable once SuspiciousTypeConversion.Global
+        if (packet is ChatOutcoming chat)
+        {
+            SentMessages.Add(chat);
+        }
+        else if (packet is GcPhase phase)
+        {
+            SentPhases.Add(phase);
+        }
+
+        SentPackets.Add(packet);
+    }
+
+    public Task StartAsync(CancellationToken token = default)
+    {
+        return Task.CompletedTask;
+    }
+
+    public IServerBase Server { get; } = Substitute.For<IServerBase>();
+    public IPAddress BoundIpAddress { get; } = IPAddress.Loopback;
+    public Guid? AccountId { get; set; } = Guid.NewGuid();
+    public string Username { get; set; } = "";
+    public IPlayerEntity? Player { get; set; }
+
+    public bool HandleHandshake(GcHandshakeData handshake)
+    {
+        return true;
+    }
+}
+
+public class CommandTests : IAsyncLifetime
+{
+    private readonly ICommandManager _commandManager;
+    private readonly IGameConnection _connection;
+    private readonly ServiceProvider _services;
+    private readonly IPlayerEntity _player;
+    private readonly IItemManager _itemManager;
+    private readonly Faker<PlayerData> _playerDataFaker;
+    private readonly IGameServer _gameServer;
+    private readonly ISkillManager _skillManager;
+    private readonly AsyncServiceScope _scope;
+    private readonly GameDbContext _db;
+    private readonly FakeTimeProvider _timeProvider = new();
+    private readonly ServerClock _clock;
+
+    public CommandTests()
+    {
+        _playerDataFaker = new AutoFaker<PlayerData>()
+            .RuleFor(x => x.Name, r => r.Name.FirstName()) // Mostly due to command param handling
+            .RuleFor(x => x.Level, _ => (byte)1)
+            .RuleFor(x => x.Id, _ => 1u)
+            .RuleFor(x => x.Iq, _ => (byte)1)
+            .RuleFor(x => x.St, _ => (byte)1)
+            .RuleFor(x => x.Ht, _ => (byte)1)
+            .RuleFor(x => x.Dx, _ => (byte)1)
+            .RuleFor(x => x.Gold, _ => (uint)0)
+            .RuleFor(x => x.Empire, _ => EEmpire.CHUNJO)
+            .RuleFor(x => x.Experience, _ => (uint)0)
+            .RuleFor(x => x.PositionX, _ => (int)(10 * Map.MAP_UNIT))
+            .RuleFor(x => x.PositionY, _ => (int)(26 * Map.MAP_UNIT))
+            .RuleFor(x => x.PlayTime, _ => 0u)
+            .RuleFor(x => x.SkillGroup, _ => ESkillGroup.BRANCH_A)
+            .RuleFor(x => x.PlayerClass, _ => EPlayerClassGendered.WARRIOR_MALE)
+            .Ignore(x => x.Health)
+            .Ignore(x => x.Mana);
+        var monsterManagerMock = Substitute.For<IMonsterManager, ILoadable>();
+        monsterManagerMock.GetMonster(Arg.Any<uint>()).Returns(callerInfo =>
+            new AutoFaker<MonsterData>()
+                .RuleFor(x => x.Id, _ => callerInfo.Arg<uint>())
+                .RuleFor(x => x.Type, _ => EEntityType.MONSTER)
+                .Generate());
+        monsterManagerMock.GetMonsters().Returns([]);
+        var experienceManagerMock = Substitute.For<IExperienceManager, ILoadable>();
+        experienceManagerMock.GetNeededExperience(Arg.Any<byte>()).Returns(1000u);
+        experienceManagerMock.MaxLevel.Returns((byte)100);
+        var jobManagerMock = Substitute.For<IJobManager>();
+        jobManagerMock.Get(Arg.Any<EPlayerClassGendered>()).Returns(new Job());
+        var itemManagerMock = Substitute.For<IItemManager, ILoadable>();
+        itemManagerMock.GetItem(Arg.Any<uint>()).Returns(call => new AutoFaker<ItemData>()
+            .RuleFor(x => x.Id, new Func<Faker, ItemData, uint>((faker, data) => call.Arg<uint>()))
+            .RuleFor(x => x.Size, _ => (byte)1)
+            .RuleFor(x => x.WearFlags, _ => (byte)EWearFlags.WEAPON)
+            .RuleFor(x => x.Values, _ =>
+            [
+                0,
+                0,
+                0,
+                10,
+                16,
+                0
+            ])
+            .Generate());
+        var cacheManagerMock = Substitute.For<ICacheManager>();
+        var redisListWrapperMock = Substitute.For<IRedisListWrapper<Guid>>();
+        var redisSubscriberWrapperMock = Substitute.For<IRedisSubscriber>();
+        redisListWrapperMock.RangeAsync(Arg.Any<int>(), Arg.Any<int>())
+            .Returns([PermGroup.OperatorGroup]);
+        cacheManagerMock.KeysAsync(Arg.Any<string>()).Returns([]);
+        cacheManagerMock.CreateList<Guid>(Arg.Any<string>()).Returns(redisListWrapperMock);
+        cacheManagerMock.Subscribe().Returns(redisSubscriberWrapperMock);
+        _skillManager = Substitute.For<ISkillManager, ILoadable>();
+        var fileProvider = Substitute.For<IFileProvider>();
+        fileProvider.GetFileInfo("maps/map_b2/Town.txt").Returns(_ =>
+        {
+            var fileInfo = Substitute.For<IFileInfo>();
+            fileInfo.Exists.Returns(true);
+            fileInfo.CreateReadStream().Returns(new MemoryStream([.. "675 1413"u8]));
+            return fileInfo;
+        });
+        fileProvider.GetFileInfo("atlasinfo.txt").Returns(_ =>
+        {
+            var fileInfo = Substitute.For<IFileInfo>();
+            fileInfo.Exists.Returns(true);
+            fileInfo.CreateReadStream().Returns(new MemoryStream(Encoding.UTF8.GetBytes(
+                $"map_a2	{Map.MAP_UNIT * 10}	{Map.MAP_UNIT * 26}	6	6\n" +
+                $"map_b2	{Map.MAP_UNIT * 10}	{Map.MAP_UNIT * 26}	6	6")));
+            return fileInfo;
+        });
+        var npcShopProvider = Substitute.For<INpcShopProvider, ILoadable>();
+        npcShopProvider.Shops.Returns([]);
+        _services = new ServiceCollection()
+            .AddCoreServices(new EmptyPluginCatalog(), new ConfigurationBuilder().Build())
+            .AddGameServices()
+            .AddSingleton(Substitute.For<IServerBase>())
+            .AddQuantumCoreTestLogger()
+            .AddSingleton(Substitute.For<IHostEnvironment>())
+            .Replace(new ServiceDescriptor(typeof(TimeProvider), _ => _timeProvider, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IItemRepository), _ => Substitute.For<IItemRepository>(),
+                ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(ICommandPermissionRepository),
+                _ =>
+                {
+                    var mock = Substitute.For<ICommandPermissionRepository>();
+                    mock.GetGroupsForPlayerAsync(Arg.Any<uint>()).Returns([PermGroup.OperatorGroup]);
+                    return mock;
+                }, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IPlayerRepository), _ => Substitute.For<IPlayerRepository>(),
+                ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IPlayerSkillsRepository),
+                _ => Substitute.For<IPlayerSkillsRepository>(),
+                ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IMonsterManager), _ => monsterManagerMock, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IItemManager), _ => itemManagerMock, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(ICacheManager), _ => cacheManagerMock, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IGuildManager), _ => Substitute.For<IGuildManager>(),
+                ServiceLifetime.Scoped))
+            .Replace(new ServiceDescriptor(typeof(INpcShopProvider), _ => npcShopProvider, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IExperienceManager), _ => experienceManagerMock,
+                ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(ISkillManager), _ => _skillManager, ServiceLifetime.Singleton))
+            .Replace(new ServiceDescriptor(typeof(IFileProvider), _ => fileProvider, ServiceLifetime.Singleton))
+            .AddSingleton<IConfiguration>(_ => new ConfigurationBuilder()
+                .AddQuantumCoreDefaults()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    { "Database:Provider", "sqlite" },
+                    { "Database:ConnectionString", "Data Source=commands.db" },
+                    { "Game:Commands:StrictMode", "true" },
+                    { "maps:0", "map_a2" },
+                    { "maps:1", "map_b2" },
+                })
+                .Build())
+            .AddSingleton(Substitute.For<IDbPlayerRepository>())
+            .AddSingleton(Substitute.For<IDbPlayerSkillsRepository>())
+            .AddSingleton<IGameConnection>(_ => new MockedGameConnection())
+            .AddSingleton<IPlayerEntity, PlayerEntity>()
+            .AddSingleton(_ => _playerDataFaker.Generate())
+            .AddSingleton(Substitute.For<IGameServer>())
+            .BuildServiceProvider();
+        _itemManager = _services.GetRequiredService<IItemManager>();
+        _commandManager = _services.GetRequiredService<ICommandManager>();
+        _commandManager.Register("QuantumCore.Game.Commands", typeof(SpawnCommand).Assembly);
+        _connection = _services.GetRequiredService<IGameConnection>();
+
+        _clock = _services.GetRequiredService<ServerClock>();
+        _connection.Server.Clock.Returns(_clock);
+        _services.GetRequiredService<IServerBase>().Clock.Returns(_clock);
+
+        _player = _services.GetRequiredService<IPlayerEntity>();
+        _player.Player.PlayTime = 0;
+        _connection.Player = _player;
+        _gameServer = _services.GetRequiredService<IGameServer>();
+        _scope = _services.CreateAsyncScope();
+        _db = _scope.ServiceProvider.GetRequiredService<GameDbContext>();
+    }
+
+    public async ValueTask InitializeAsync()
+    {
+        await _db.Database.EnsureDeletedAsync();
+        await _db.Database.EnsureCreatedAsync();
+        await _player.LoadAsync();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _db.DisposeAsync();
+        await _scope.DisposeAsync();
+        await _services.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ClearInventoryCommandAsync()
+    {
+        await _player.Inventory.PlaceItemAsync(new ItemInstance { Count = 1, ItemId = 1 });
+
+        Assert.NotEmpty(_player.Inventory.Items);
+        await _commandManager.HandleAsync(_connection, "/ip");
+
+        Assert.Empty(_player.Inventory.Items);
+    }
+
+    [Fact]
+    public async Task CommandTeleportToAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+        world.Update(Tick()); // spawn entities
+        player2.Move((int)(11 * Map.MAP_UNIT), (int)(27 * Map.MAP_UNIT));
+
+        Assert.Equal((int)(10 * Map.MAP_UNIT), _player.PositionX);
+        Assert.Equal((int)(26 * Map.MAP_UNIT), _player.PositionY);
+
+        await _commandManager.HandleAsync(_connection, $"/tp \"{player2.Name}\"");
+
+        Assert.Equal((int)(11 * Map.MAP_UNIT), _player.PositionX);
+        Assert.Equal((int)(27 * Map.MAP_UNIT), _player.PositionY);
+    }
+
+    [Fact]
+    public async Task CommandTeleportHereAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+        world.Update(Tick()); // spawn entities
+        player2.Move((int)(11 * Map.MAP_UNIT), (int)(27 * Map.MAP_UNIT));
+
+
+        Assert.Equal((int)(11 * Map.MAP_UNIT), player2.PositionX);
+        Assert.Equal((int)(27 * Map.MAP_UNIT), player2.PositionY);
+
+        await _commandManager.HandleAsync(_connection, $"/tphere \"{player2.Name}\"");
+
+        Assert.Equal((int)(10 * Map.MAP_UNIT), player2.PositionX);
+        Assert.Equal((int)(26 * Map.MAP_UNIT), player2.PositionY);
+    }
+
+    [Fact]
+    public async Task DebugCommandAsync()
+    {
+        var item = new ItemInstance { ItemId = 1, Count = 1 };
+        var wearSlot = _player.Inventory.EquipmentWindow.GetWearPosition(_itemManager, item.ItemId);
+
+        await _player.SetItemAsync(item, WindowType.INVENTORY, (ushort)wearSlot);
+
+        await _commandManager.HandleAsync(_connection, "debug_damage");
+        // simple calculation just for this test
+        var minAttack = _player.GetPoint(EPoint.MIN_ATTACK_DAMAGE);
+        var maxAttack = _player.GetPoint(EPoint.MAX_ATTACK_DAMAGE);
+        var sentMessages = (_connection as MockedGameConnection).SentMessages;
+
+        sentMessages.Should().ContainEquivalentOf(new ChatOutcoming { Message = $"Weapon Damage: 10-16" }, Config);
+        sentMessages.Should()
+            .ContainEquivalentOf(new ChatOutcoming { Message = $"Attack Damage: {minAttack}-{maxAttack}" }, Config);
+        return;
+
+        EquivalencyOptions<ChatOutcoming> Config(EquivalencyOptions<ChatOutcoming> cfg) =>
+            cfg.Including(x => x.Message);
+    }
+
+    [Fact]
+    public async Task ExperienceSelfCommandAsync()
+    {
+        await _commandManager.HandleAsync(_connection, "/exp 500");
+
+        _player.GetPoint(EPoint.EXPERIENCE).Should().Be(500);
+    }
+
+    [Fact]
+    public async Task ExperienceOtherCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+
+        await _commandManager.HandleAsync(_connection, $"/exp 500 \"{player2.Name}\"");
+
+        player2.GetPoint(EPoint.EXPERIENCE).Should().Be(500);
+    }
+
+    [Fact]
+    public async Task GiveSelfItemCommandAsync()
+    {
+        await _commandManager.HandleAsync(_connection, "/give $self 1 10");
+
+        _player.Inventory.Items.Should().NotBeEmpty();
+        _player.Inventory.Items.Should().ContainEquivalentOf(new ItemInstance { ItemId = 1, Count = 10 },
+            cfg => cfg.Including(x => x.ItemId).Including(x => x.Count));
+    }
+
+    [Fact]
+    public async Task GiveOtherItemCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+
+        await _commandManager.HandleAsync(_connection, $"/give \"{player2.Name}\" 1 10");
+
+        player2.Inventory.Items.Should().NotBeEmpty();
+        player2.Inventory.Items.Should().ContainEquivalentOf(new ItemInstance { ItemId = 1, Count = 10 },
+            cfg => cfg.Including(x => x.ItemId).Including(x => x.Count));
+    }
+
+    [Fact]
+    public async Task GiveItemCommand_InvalidPlayerAsync()
+    {
+        await _commandManager.HandleAsync(_connection, "/give missing 1 10");
+
+        ((MockedGameConnection)_connection).SentMessages.Should()
+            .ContainEquivalentOf(new ChatOutcoming { Message = "Target not found" },
+                cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task GoldCommand_SelfAsync()
+    {
+        _player.GetPoint(EPoint.GOLD).Should().Be(0);
+        await _commandManager.HandleAsync(_connection, "/gold 10");
+
+        _player.GetPoint(EPoint.GOLD).Should().Be(10);
+    }
+
+    [Fact]
+    public async Task GoldCommand_OtherAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+
+        player2.GetPoint(EPoint.GOLD).Should().Be(0);
+        await _commandManager.HandleAsync(_connection, $"/gold 10 \"{player2.Name}\"");
+        player2.GetPoint(EPoint.GOLD).Should().Be(10);
+    }
+
+    [Fact]
+    public async Task GotoCommand_CoordsAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+        world.Update(Tick()); // spawn entities
+
+        _player.Move((int)(Map.MAP_UNIT * 10), (int)(Map.MAP_UNIT * 26));
+
+        Assert.Equal((int)(10 * Map.MAP_UNIT), _player.PositionX);
+        Assert.Equal((int)(26 * Map.MAP_UNIT), _player.PositionY);
+
+        await _commandManager.HandleAsync(_connection, "/goto 11 27");
+
+        Assert.Equal((int)(_player.Map.Position.X + 11 * 100), _player.PositionX);
+        Assert.Equal((int)(_player.Map.Position.Y + 27 * 100), _player.PositionY);
+    }
+
+    [Fact]
+    public async Task GotoCommand_MapAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+        world.Update(Tick()); // spawn entities
+
+
+        Assert.Equal((int)(10 * Map.MAP_UNIT), _player.PositionX);
+        Assert.Equal((int)(26 * Map.MAP_UNIT), _player.PositionY);
+
+        await _commandManager.HandleAsync(_connection, "/goto --map map_b2");
+
+        // target position is half of X & Y
+        Assert.Equal((int)(13 * Map.MAP_UNIT), _player.PositionX);
+        Assert.Equal((int)(29 * Map.MAP_UNIT), _player.PositionY);
+    }
+
+    [Fact]
+    public async Task HelpCommandAsync()
+    {
+        await _commandManager.HandleAsync(_connection, "/help");
+
+        var messages = (_connection as MockedGameConnection).SentMessages;
+        messages.Should().HaveCountGreaterThan(1);
+        messages[0].Should().BeEquivalentTo(
+            new ChatOutcoming { Message = "The following commands are available", MessageType = ChatMessageType.INFO },
+            cfg => cfg
+                .Including(x => x.Message)
+                .Using<string>(ctx => ctx.Subject.Should().StartWith(ctx.Expectation)).WhenTypeIs<string>()
+        );
+    }
+
+    [Fact]
+    public async Task KickCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+
+        await _commandManager.HandleAsync(_connection, $"/kick \"{player2.Name}\"");
+
+        Assert.Null(world.GetPlayer(player2.Name));
+    }
+
+    [Fact]
+    public async Task KickCommand_InvalidAsync()
+    {
+        await _commandManager.HandleAsync(_connection, "/kick something");
+
+        (_connection as MockedGameConnection).SentMessages.Should()
+            .ContainEquivalentOf(new ChatOutcoming { Message = "Target not found" },
+                cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task LevelCommand_SelfAsync()
+    {
+        _player.GetPoint(EPoint.LEVEL).Should().Be(1);
+
+        await _commandManager.HandleAsync(_connection, "/level 30");
+
+        _player.GetPoint(EPoint.LEVEL).Should().Be(30);
+    }
+
+    [Fact]
+    public async Task LevelCommand_OtherAsync()
+    {
+        var world = await PrepareWorldAsync();
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        world.SpawnEntity(_player);
+        world.SpawnEntity(player2);
+
+        player2.GetPoint(EPoint.LEVEL).Should().Be(1);
+
+        await _commandManager.HandleAsync(_connection, $"/level 30 \"{player2.Name}\"");
+
+        player2.GetPoint(EPoint.LEVEL).Should().Be(30);
+    }
+
+    [Fact]
+    public async Task LogoutCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+
+        world.GetPlayer(_player.Name).Should().NotBeNull();
+
+        _player.Player.PlayTime = 0;
+        _timeProvider.Advance(TimeSpan.FromMinutes(1));
+
+        await _commandManager.HandleAsync(_connection, "/logout");
+
+        _player.GetPoint(EPoint.PLAY_TIME).Should().Be(1);
+        world.GetPlayer(_player.Name).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task PhaseSelectCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+
+        world.GetPlayer(_player.Name).Should().NotBeNull();
+        (_connection as MockedGameConnection).SentPhases.Should()
+            .NotContainEquivalentOf(new GcPhase { Phase = EPhase.SELECT });
+
+        _player.Player.PlayTime = 0;
+        _timeProvider.Advance(TimeSpan.FromMinutes(1));
+
+        await _commandManager.HandleAsync(_connection, "/phase_select");
+
+        _player.GetPoint(EPoint.PLAY_TIME).Should().Be(1);
+        _player.Connection.Phase.Should().Be(EPhase.SELECT);
+        (_connection as MockedGameConnection).SentPhases.Should()
+            .ContainEquivalentOf(new GcPhase { Phase = EPhase.SELECT });
+        world.GetPlayer(_player.Name).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task QuitCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+
+        world.GetPlayer(_player.Name).Should().NotBeNull();
+
+        await _commandManager.HandleAsync(_connection, "/quit");
+
+        world.GetPlayer(_player.Name).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task RestartHereCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+
+        _player.Health.Should().Be(676L);
+        _player.Mana.Should().Be(264L);
+        _player.PositionX.Should().Be(256000);
+        _player.PositionY.Should().Be(665600);
+        _player.Die();
+
+        await _commandManager.HandleAsync(_connection, "/restart_here");
+
+        _player.Health.Should().Be(PlayerConstants.RESPAWN_HEALTH);
+        _player.Mana.Should().Be(PlayerConstants.RESPAWN_MANA);
+        _player.PositionX.Should().Be(256000);
+        _player.PositionY.Should().Be(665600);
+    }
+
+    [Fact]
+    public async Task RestartTownCommandAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+        world.Update(Tick(0.1));
+        _player.Map.Should().NotBeNull();
+
+        _player.Health.Should().Be(676L);
+        _player.Mana.Should().Be(264L);
+        _player.PositionX.Should().Be(256000);
+        _player.PositionY.Should().Be(665600);
+        _player.Die();
+
+        await _commandManager.HandleAsync(_connection, "/restart_town");
+
+        _player.Health.Should().Be(PlayerConstants.RESPAWN_HEALTH);
+        _player.Mana.Should().Be(PlayerConstants.RESPAWN_MANA);
+
+        _player.PositionX.Should().Be((int)(_player.Map.Position.X + 675 * Map.SPAWN_POSITION_MULTIPLIER));
+        _player.PositionY.Should().Be((int)(_player.Map.Position.Y + 1413 * Map.SPAWN_POSITION_MULTIPLIER));
+    }
+
+    [Fact]
+    public async Task SpawnCommand_WithoutCountAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+        world.Update(Tick()); // spawn entities
+        _player.Move((int)(Map.MAP_UNIT * 13), (int)(Map.MAP_UNIT * 29)); // center of the map
+        _player.Map.Entities.Count.Should().Be(1);
+
+        await _commandManager.HandleAsync(_connection, "/spawn 101");
+        world.Update(Tick()); // spawn entities
+
+        _player.Map.Entities.Count.Should().Be(2);
+    }
+
+    [Fact]
+    public async Task SpawnCommand_WithCountAsync()
+    {
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(_player);
+        world.Update(Tick()); // spawn entities
+        _player.Move((int)(Map.MAP_UNIT * 13), (int)(Map.MAP_UNIT * 29)); // center of the map
+        _player.Map.Entities.Count.Should().Be(1);
+
+        await _commandManager.HandleAsync(_connection, "/spawn 101 10");
+        world.Update(Tick()); // spawn entities
+
+        _player.Map.Entities.Count.Should().Be(11);
+    }
+
+    [Fact]
+    public async Task StatCommandAsync()
+    {
+        _player.AddPoint(EPoint.STATUS_POINTS, 1);
+        _player.GetPoint(EPoint.HT).Should().Be(1);
+
+        await _commandManager.HandleAsync(_connection, "/stat ht");
+
+        _player.GetPoint(EPoint.HT).Should().Be(2);
+    }
+
+    private async Task<IWorld> PrepareWorldAsync()
+    {
+        if (!Directory.Exists("data")) Directory.CreateDirectory("data");
+        await Task.WhenAll(_services.GetServices<ILoadable>().Select(x => x.LoadAsync()));
+        var world = _services.GetRequiredService<IWorld>();
+        await world.LoadAsync();
+        await world.InitAsync();
+        return world;
+    }
+
+    [Fact]
+    public async Task ReloadPermissionsCommand_WithoutTargetAsync()
+    {
+        // Prepare
+        var updatedGroup = Guid.NewGuid();
+        var groupName = "test";
+
+        var newPermissions = new[] { "reload_perms", "goto" };
+        var cacheManager = _services.GetRequiredService<ICacheManager>();
+        var commandRepo = _services.GetRequiredService<ICommandPermissionRepository>();
+        commandRepo.GetPermissionsForGroupAsync(Arg.Any<Guid>()).Returns(newPermissions);
+        commandRepo.GetGroupsAsync().Returns([
+            new PermissionGroup { Id = updatedGroup, Name = groupName, Permissions = newPermissions }
+        ]);
+
+        cacheManager.CreateList<Guid>(Arg.Any<string>())
+            .RangeAsync(0, 0).Returns([updatedGroup]);
+
+        // Act
+        await _commandManager.HandleAsync(_connection, "/reload_perms");
+
+        // Assert
+        _commandManager.Groups.Keys.Should().Contain(updatedGroup);
+        _commandManager.Groups.Values.Should().ContainEquivalentOf(new PermissionGroup
+        {
+            Id = updatedGroup, Name = groupName, Permissions = newPermissions
+        });
+
+        await _commandManager.ReloadAsync(TestContext.Current.CancellationToken);
+
+        await _player.ReloadPermissionsAsync();
+
+        ((MockedGameConnection)_connection).SentMessages.Should().ContainEquivalentOf(
+            new ChatOutcoming { Message = "Permissions reloaded" }, cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task InGameShopCommandAsync()
+    {
+        // Prepare
+        _services.GetRequiredService<IOptions<GameOptions>>().Value.InGameShop = "test";
+
+        // Act
+        await _commandManager.HandleAsync(_connection, "/in_game_mall");
+
+        // Assert
+        ((MockedGameConnection)_connection).SentMessages.Should().ContainEquivalentOf(
+            new ChatOutcoming { Message = "mall test", MessageType = ChatMessageType.COMMAND },
+            cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task UserCommandAsync()
+    {
+        _gameServer.Connections.Returns([_connection]);
+
+        await _commandManager.HandleAsync(_connection, "/user");
+
+        ((MockedGameConnection)_connection).SentMessages.Should().ContainEquivalentOf(
+            new ChatOutcoming
+            {
+                Message = $"Lv{_player.GetPoint(EPoint.LEVEL)} {_player.Name}", MessageType = ChatMessageType.INFO
+            }, cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task AdvanceCommand_NoLevelAsync()
+    {
+        _player.SetPoint(EPoint.LEVEL, 1);
+
+        await _commandManager.HandleAsync(_connection, $"/a $self");
+
+        _player.GetPoint(EPoint.LEVEL).Should().Be(2);
+
+        ((MockedGameConnection)_connection).SentMessages.Should().ContainEquivalentOf(
+            new ChatOutcoming { Message = "You have advanced to level 2" }, cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task AdvanceCommand_LevelSpecifiedAsync()
+    {
+        _player.SetPoint(EPoint.LEVEL, 1);
+
+        await _commandManager.HandleAsync(_connection, $"/a $self 10");
+
+        _player.GetPoint(EPoint.LEVEL).Should().Be(11);
+
+        ((MockedGameConnection)_connection).SentMessages.Should().ContainEquivalentOf(
+            new ChatOutcoming { Message = "You have advanced to level 11" }, cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task AdvanceCommand_OtherTargetAsync()
+    {
+        using var player2 = ActivatorUtilities.CreateInstance<PlayerEntity>(_services, _playerDataFaker.Generate());
+        player2.SetPoint(EPoint.LEVEL, 1);
+
+        var world = await PrepareWorldAsync();
+        world.SpawnEntity(player2);
+
+        await _commandManager.HandleAsync(_connection, $"/a {player2.Player.Name} 4");
+
+        player2.GetPoint(EPoint.LEVEL).Should().Be(5);
+
+        ((MockedGameConnection)_connection).SentMessages.Should().ContainEquivalentOf(
+            new ChatOutcoming { Message = "You have advanced to level 5" }, cfg => cfg.Including(x => x.Message));
+    }
+
+    [Fact]
+    public async Task SetJobCommand_ValidLevelAsync()
+    {
+        // Prepare
+        _player.Player.SkillGroup = 0;
+        _player.Player.PlayerClass = 0;
+        _player.SetPoint(EPoint.LEVEL, 5);
+
+        // Act
+        await _commandManager.HandleAsync(_connection, "/setjob 1");
+
+        // Assert
+        _player.Player.SkillGroup.Should().Be(ESkillGroup.BRANCH_A);
+        ((MockedGameConnection)_connection).SentPackets.Should()
+            .ContainEquivalentOf(new ChangeSkillGroup { SkillGroup = ESkillGroup.BRANCH_A });
+    }
+
+    [Fact]
+    public async Task SetJobCommand_InvalidLevelAsync()
+    {
+        // Prepare
+        _player.Player.SkillGroup = 0;
+        _player.SetPoint(EPoint.LEVEL, 3);
+
+        // Act
+        await _commandManager.HandleAsync(_connection, "/setjob 1");
+
+        // Assert
+        _player.Player.SkillGroup.Should().Be(0);
+        ((MockedGameConnection)_connection).SentPackets.Should()
+            .NotContainEquivalentOf(new ChangeSkillGroup { SkillGroup = ESkillGroup.BRANCH_A });
+    }
+
+    [Fact]
+    public async Task SetJobCommand_InvalidJobAsync()
+    {
+        // Prepare
+        _player.Player.SkillGroup = 0;
+        _player.SetPoint(EPoint.LEVEL, 5);
+
+        // Act
+        await _commandManager.HandleAsync(_connection, "/setjob 4");
+
+        // Assert
+        _player.Player.SkillGroup.Should().Be(0);
+        ((MockedGameConnection)_connection).SentPackets.Should()
+            .NotContainEquivalentOf(new ChangeSkillGroup { SkillGroup = (ESkillGroup)4 });
+    }
+
+    [Fact]
+    public async Task SkillUpCommand_ValidSkillAsync()
+    {
+        // Prepare
+        _player.SetPoint(EPoint.LEVEL, 5);
+        _player.Player.PlayerClass = 0;
+
+        var skillId = ESkill.AURA_OF_THE_SWORD;
+
+        _skillManager.GetSkill(skillId).Returns(new SkillData
+        {
+            Id = skillId, Type = (ESkillCategoryType)(_player.Player.PlayerClass + 1), Flags = ESkillFlags.ATTACK
+        });
+        _player.Skills.SetSkillGroup(ESkillGroup.BRANCH_A);
+
+        // Act
+        await _commandManager.HandleAsync(_connection, $"/skillup {(uint)skillId}");
+
+        // Assert
+        var skill = _player.Skills[skillId];
+        skill.Should().NotBeNull();
+        skill.Level.Should().Be(ESkillLevel.NORMAL01);
+    }
+
+    [Fact]
+    public async Task SkillUpCommand_MasterSkillAsync()
+    {
+        // Prepare
+        _player.SetPoint(EPoint.LEVEL, 5);
+        _player.Player.PlayerClass = 0;
+        const ESkill SKILL_ID = ESkill.AURA_OF_THE_SWORD;
+
+        _skillManager.GetSkill(SKILL_ID).Returns(new SkillData
+        {
+            Id = SKILL_ID, Type = (ESkillCategoryType)(_player.Player.PlayerClass + 1), Flags = ESkillFlags.ATTACK
+        });
+        _player.Skills.SetSkillGroup(ESkillGroup.BRANCH_A);
+        _player.Skills[SKILL_ID].Level = ESkillLevel.NORMAL19;
+        _player.Skills[SKILL_ID].MasterType = ESkillMasterType.NORMAL;
+
+        // Act
+        await _commandManager.HandleAsync(_connection, $"/skillup {(uint)SKILL_ID}");
+
+        // Assert
+        var skill = _player.Skills[SKILL_ID];
+        skill.Should().NotBeNull();
+        skill.Level.Should().Be(ESkillLevel.MASTER_M1);
+        skill.MasterType.Should().Be(ESkillMasterType.MASTER);
+    }
+
+    private TickContext Tick(double elapsedMilliseconds = 0)
+    {
+        var delta = TimeSpan.FromMilliseconds(elapsedMilliseconds);
+        _timeProvider.Advance(delta);
+        var now = _clock.Now;
+        return new TickContext(_clock, delta, now);
+    }
+}

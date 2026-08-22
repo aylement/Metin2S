@@ -1,0 +1,11 @@
+﻿using QuantumCore.Networking;
+
+namespace QuantumCore.API.Packets.Guild;
+
+[Packet(0x50, EDirection.INCOMING, Sequence = true)]
+[SubPacket(0x06, 0)]
+[PacketGenerator]
+public partial class GuildNewsDelete
+{
+    [Field(0)] public uint Id { get; set; }
+}

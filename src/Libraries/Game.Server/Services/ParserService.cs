@@ -1,0 +1,600 @@
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using EnumsNET;
+using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Logging;
+using QuantumCore.API;
+using QuantumCore.API.Core.Models;
+using QuantumCore.API.Game.Types.Monsters;
+using QuantumCore.API.Game.Types.Skills;
+using QuantumCore.Core.Utils;
+using QuantumCore.Game.Drops;
+using QuantumCore.Game.World;
+
+namespace QuantumCore.Game.Services;
+
+public partial class ParserService : IParserService
+{
+    private readonly IFileProvider _fileProvider;
+    private static readonly NumberFormatInfo InvNum = NumberFormatInfo.InvariantInfo;
+    private const StringComparison INV_CUL = StringComparison.InvariantCultureIgnoreCase;
+
+    private readonly ILogger<ParserService> _logger;
+
+    public ParserService(ILoggerFactory loggerFactory, IFileProvider fileProvider)
+    {
+        _fileProvider = fileProvider;
+        _logger = loggerFactory.CreateLogger<ParserService>();
+    }
+
+
+    public SpawnPoint? GetSpawnFromLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return null;
+        var splitted = SplitByWhitespaceRegex().Split(line.Trim());
+        if (string.IsNullOrWhiteSpace(splitted[0]) || splitted[0].StartsWith("//")) return null;
+        return new SpawnPoint
+        {
+            Type = Enums.Parse<ESpawnPointType>(splitted[0].AsSpan()[..1], true, EnumFormat.EnumMemberValue),
+            IsAggressive = splitted[0].Length > 1 &&
+                           splitted[0].AsSpan()[1..2].Equals("a", StringComparison.InvariantCultureIgnoreCase),
+            X = int.Parse(splitted[1]),
+            Y = int.Parse(splitted[2]),
+            RangeX = int.Parse(splitted[3]),
+            RangeY = int.Parse(splitted[4]),
+            Direction = (ESpawnPointDirection)int.Parse(splitted[6]),
+            RespawnTime = ParseSecondsFromTimespanString(splitted[7].Trim()),
+            Chance = short.Parse(splitted[8]),
+            MaxAmount = short.Parse(splitted[9]),
+            Monster = uint.Parse(splitted[10])
+        };
+    }
+
+    public async Task<ImmutableArray<CommonDropEntry>> GetCommonDropsAsync(TextReader sr,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sr);
+        var list = new List<CommonDropEntry>();
+        while (await sr.ReadLineAsync(cancellationToken) is { } line)
+        {
+            ParseCommonDropAndAdd(line, list);
+        }
+
+        return [.. list];
+    }
+
+    public async Task<ImmutableArray<SkillData>> GetSkillsAsync(string path, CancellationToken token = default)
+    {
+        var file = _fileProvider.GetFileInfo(path);
+        if (!file.Exists)
+        {
+            _logger.LogWarning("{Path} does not exist, skills information not loaded", path);
+            return [];
+        }
+
+        var list = new List<SkillData>();
+        await using var fs = file.CreateReadStream();
+        using var sr = new StreamReader(fs);
+        while (await sr.ReadLineAsync(token).ConfigureAwait(false) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line) || !StartsWithNumberRegex().IsMatch(line)) continue;
+
+            // parse line
+            var split = line.Split('\t');
+
+            try
+            {
+                if (!Enum.TryParse<ESkill>(split[0], true, out var id))
+                {
+                    _logger.LogWarning("Failed to parse Skill with Id({Id}) from line: {Line}", split[0], line);
+                    continue;
+                }
+
+                var data = new SkillData
+                {
+                    Id = id,
+                    Name = split[1],
+                    Type = (ESkillCategoryType)short.Parse(split[2]),
+                    LevelStep = short.Parse(split[3]),
+                    MaxLevel = short.Parse(split[4]),
+                    LevelLimit = short.Parse(split[5]),
+                    PointOn = split[6],
+                    PointPoly = split[7],
+                    SpCostPoly = split[8],
+                    DurationPoly = split[9],
+                    DurationSpCostPoly = split[10],
+                    CooldownPoly = split[11],
+                    MasterBonusPoly = split[12],
+                    AttackGradePoly = split[13],
+                    Flags = ExtractSkillFlags(split[14]),
+                    AffectFlag = ExtractAffectFlags(split[15]),
+                    PointOn2 = split[16],
+                    PointPoly2 = split[17],
+                    DurationPoly2 = split[18],
+                    AffectFlag2 = ExtractAffectFlags(split[19]),
+                    PrerequisiteSkillVnum = int.Parse(split[20]),
+                    PrerequisiteSkillLevel = int.Parse(split[21]),
+                    SkillType =
+                        Enum.TryParse<ESkillType>(split[22], true, out var result) ? result : ESkillType.NORMAL,
+                    MaxHit = short.Parse(split[23]),
+                    SplashAroundDamageAdjustPoly = split[24],
+                    TargetRange = int.Parse(split[25]),
+                    SplashRange = uint.Parse(split[26])
+                };
+
+                list.Add(data);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Failed to parse skill data from line: {Line}", line);
+            }
+        }
+
+        _logger.LogInformation("Loaded {Count} skills", list.Count);
+
+        return [.. list];
+    }
+
+    public async Task<ImmutableArray<DataFileGroup>> ParseFileGroupsAsync(StreamReader sr,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(sr);
+        var groups = new List<DataFileGroup>();
+        DataFileGroup? currentGroup = null;
+
+        while (await sr.ReadLineAsync(token) is { } line)
+        {
+            if (line.Trim().All(c => c == '\t') || string.IsNullOrWhiteSpace(line.Trim()))
+            {
+                continue;
+            }
+
+            if (line.StartsWith("Group", INV_CUL))
+            {
+                line = line.Trim();
+                if (currentGroup is not null)
+                {
+                    groups.Add(currentGroup);
+                }
+
+                // remove empty or whitespace entries
+                line = SplitByWhitespaceOrTabRegex().Replace(line, " ");
+                currentGroup = new DataFileGroup { Name = line.Split()[1] };
+            }
+            else if (!string.IsNullOrWhiteSpace(line) && currentGroup is not null)
+            {
+                var parts = SplitByWhitespaceOrTabRegex().Split(line).ToList();
+
+                parts.RemoveAll(IsEmptyOrContainsNewlineOrTab);
+
+                if (parts.Count == 0) continue; // can happen due to filtering
+
+                for (var i = 0; i < parts.Count; i++)
+                {
+                    parts[i] = parts[i].Trim();
+                }
+
+                if (!StartsWithNumberRegex().IsMatch(parts[0])) // Assuming all fields do not start with a number
+                {
+                    currentGroup.Fields[parts[0].Trim()] = parts[^1].Trim();
+                }
+                else
+                {
+                    if (parts.Count == 0) continue; // can happen due to filtering
+                    currentGroup.Data.Add(parts);
+                }
+            }
+        }
+
+        if (currentGroup is not null)
+        {
+            groups.Add(currentGroup);
+        }
+
+        return [.. groups];
+    }
+
+    public MonsterDropContainer? ParseMobGroup(DataFileGroup group, IItemManager itemManager)
+    {
+        ArgumentNullException.ThrowIfNull(group);
+        ArgumentNullException.ThrowIfNull(itemManager);
+        uint minKillCount = 0;
+        uint levelLimit = 0;
+
+        var type = group.GetField<string>("Type");
+        if (type is null)
+        {
+            throw new MissingRequiredFieldException("Type");
+        }
+
+        var monsterProtoId = group.GetField<uint>("Mob");
+        if (monsterProtoId == default)
+        {
+            throw new MissingRequiredFieldException("Mob");
+        }
+
+        if (type.Equals("Kill", INV_CUL))
+        {
+            minKillCount = group.GetField<uint>("kill_drop");
+        }
+        else
+        {
+            minKillCount = 1;
+        }
+
+        if (type.Equals("Limit", INV_CUL))
+        {
+            levelLimit = group.GetField<uint>("Level_limit");
+            if (levelLimit == default)
+            {
+                throw new MissingRequiredFieldException("Level_limit");
+            }
+        }
+        else
+        {
+            levelLimit = 0;
+        }
+
+        if (minKillCount == 0)
+        {
+            return null;
+        }
+
+        if (type.Equals("Kill", INV_CUL)) // MobItemGroup
+        {
+            var entry = new MonsterItemGroup { MonsterProtoId = monsterProtoId, MinKillCount = minKillCount, };
+
+            foreach (var dropData in group.Data)
+            {
+                var itemProtoId = uint.TryParse(dropData[1], InvNum, out var id) ? id : 0;
+                if (itemProtoId < 1)
+                {
+                    var item = itemManager.GetItemByName(dropData[1]); // Some entries are the names instead of the id
+                    if (item is null)
+                    {
+                        throw new MissingRequiredFieldException("ItemProtoId");
+                    }
+
+                    itemProtoId = item.Id;
+                }
+
+                var count = uint.Parse(dropData[2], InvNum);
+                if (count < 1)
+                {
+                    throw new MissingRequiredFieldException("Count");
+                }
+
+                var chance = uint.TryParse(dropData[3], InvNum, out var ch) ? ch : 0;
+                if (chance <= 0)
+                {
+                    throw new MissingRequiredFieldException("Chance");
+                }
+
+                var rareChance = int.Parse(dropData[4], InvNum);
+                rareChance = MathUtils.MinMax(0, rareChance, 100);
+
+                entry.AddDrop(itemProtoId, count, chance, (uint)rareChance);
+            }
+
+            return entry;
+        }
+
+        if (type.Equals("Drop", INV_CUL)) // DropItemGroup
+        {
+            var drops = new List<DropItemGroup.Drop>();
+
+            foreach (var dropData in group.Data)
+            {
+                var itemProtoId = uint.Parse(dropData[1], InvNum);
+                if (itemProtoId < 1)
+                {
+                    throw new MissingRequiredFieldException("ItemProtoId");
+                }
+
+                var count = uint.Parse(dropData[2], InvNum);
+                if (count < 1)
+                {
+                    throw new MissingRequiredFieldException("Count");
+                }
+
+                var chance = float.Parse(dropData[3], InvNum);
+                if (chance <= 0)
+                {
+                    throw new MissingRequiredFieldException("Chance");
+                }
+
+                chance *= 10000.0f; // to make it 0-1000
+
+                drops.Add(new DropItemGroup.Drop { ItemProtoId = itemProtoId, Amount = count, Chance = chance });
+            }
+
+            return new DropItemGroup
+            {
+                MonsterProtoId = monsterProtoId,
+                Drops = [.. drops]
+            };
+        }
+
+        if (type.Equals("Limit", INV_CUL)) // LevelItemGroup
+        {
+            var drops = new List<LevelItemGroup.Drop>();
+            foreach (var dropData in group.Data)
+            {
+                uint itemProtoId = uint.TryParse(dropData[1], InvNum, out var id) ? id : 0;
+                if (itemProtoId < 1)
+                {
+                    var item = itemManager.GetItemByName(dropData[1]); // Some entries are the names instead of the id
+                    if (item is null)
+                    {
+                        throw new MissingRequiredFieldException("ItemProtoId");
+                    }
+
+                    itemProtoId = item.Id;
+                }
+
+                var count = uint.Parse(dropData[2], InvNum);
+                if (count < 1)
+                {
+                    throw new MissingRequiredFieldException("Count");
+                }
+
+                var chance = float.Parse(dropData[3], InvNum);
+                if (chance <= 0)
+                {
+                    throw new MissingRequiredFieldException("Chance");
+                }
+
+                chance *= 10000.0f; // to make it 0-1000
+
+                drops.Add(new LevelItemGroup.Drop { ItemProtoId = itemProtoId, Amount = count, Chance = chance });
+            }
+
+            return new LevelItemGroup
+            {
+                LevelLimit = levelLimit,
+                Drops = [.. drops]
+            };
+        }
+
+        return null;
+    }
+
+    private static int ParseSecondsFromTimespanString(ReadOnlySpan<char> str)
+    {
+        var value = int.Parse(str[..^1]);
+        if (str.EndsWith("s", StringComparison.InvariantCultureIgnoreCase))
+        {
+            return value;
+        }
+
+        if (str.EndsWith("m", StringComparison.InvariantCultureIgnoreCase))
+        {
+            return value * 60;
+        }
+
+        if (str.EndsWith("h", StringComparison.InvariantCultureIgnoreCase))
+        {
+            return value * 3600;
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(str), $"Don't know how to parse \"{str}\" to TimeSpan");
+    }
+
+    private static ESkillFlags ExtractSkillFlags(string value)
+    {
+        ESkillFlags result = 0;
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return result;
+        }
+
+        var flags = value.Split(',');
+
+        foreach (var flag in flags)
+        {
+            if (!EnumUtils.TryParseEnum<ESkillFlags>(flag, out var parsed)) continue;
+            result |= parsed;
+        }
+
+        return result;
+    }
+
+    private static EAffectFlags ExtractAffectFlags(string value)
+    {
+        EAffectFlags result = 0;
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return result;
+        }
+
+        var flags = value.Split(',');
+
+        foreach (var flag in flags)
+        {
+            var trimmed = flag.Trim();
+            if (trimmed.Length == 0) continue;
+
+            // The real client's own skilltable.txt (this repo's shipped copy was replaced with it - see
+            // rapport-bots.txt #27c) encodes this column as a raw BIT INDEX, not a symbolic name: e.g.
+            // "15" for Aura of the Sword's AffectFlag, matching EAffectFlags.GEOMGYEONG = 1 << 15 exactly
+            // (same for every other numeric value observed in the live data against its matching named
+            // flag's shift amount). The name-based lookup below is this repo's OWN previous data
+            // convention (friendly names like "GEOMGYEONG") - kept as a fallback for any row that still
+            // uses it. Confirmed live: without this, EVERY buff skill whose AffectFlag/AffectFlag2 is now
+            // numeric (Aura, Berserker Fury, Strong Body, and the equivalent active buff on every other
+            // class - 15 of 77 skills) silently lost its flag entirely (TryParseEnum has nothing to match
+            // "15" against), so ApplySkillBuff's AffectAdd packet went out with Flag=0 - no buff icon, no
+            // weapon aura, even though the underlying stat buff itself still applied correctly server-side.
+            // "0" is treated as NONE rather than bit 0 (YMIR) - no real player skill needs YMIR here, and
+            // this repo's previous data used the text "NONE" (also 0) for the one skill that has this
+            // value, which is a non-castable skill either way (PointOn is NONE too).
+            if (int.TryParse(trimmed, out var bitIndex))
+            {
+                if (bitIndex is > 0 and < 32)
+                {
+                    result |= (EAffectFlags)(1 << bitIndex);
+                }
+
+                continue;
+            }
+
+            if (!EnumUtils.TryParseEnum<EAffectFlags>(trimmed, out var parsed)) continue;
+            result |= parsed;
+        }
+
+        return result;
+    }
+
+    private static void ParseCommonDropAndAdd(ReadOnlySpan<char> line, List<CommonDropEntry> list)
+    {
+        var trimmedLine = line.Trim();
+        if (trimmedLine.StartsWith("PAWN")) return; // skip if first line - headers
+        var totalRead = 0;
+        // Each line has 4 tab-separated sections, one per monster rank, in this exact order - matches the
+        // real server's own read loop (`for (int i = 0; i <= MOB_RANK_S_KNIGHT; ++i)`,
+        // item_manager_read_tables.cpp) and this repo's own EMonsterLevel ordering. Only ranks 0-3 ever get
+        // a row here - a BOSS-rank kill correctly gets none of this file's drops (see CommonDropEntry's
+        // doc comment for why that matters).
+        var rankIndex = 0;
+        CommonDropEntry? commonDrop;
+        do
+        {
+            if (trimmedLine.IsEmpty || totalRead >= trimmedLine.Length) return;
+            var startIndex = Math.Max(totalRead - 1, 0);
+            commonDrop = ParseCommonDropFromLine(trimmedLine[startIndex..], (EMonsterLevel)rankIndex, out var read);
+            totalRead += read;
+            rankIndex++;
+            if (commonDrop is not null)
+            {
+                list.Add(commonDrop.Value);
+            }
+        } while (commonDrop is not null);
+    }
+
+    private static CommonDropEntry? ParseCommonDropFromLine(ReadOnlySpan<char> line, EMonsterLevel rank, out int read)
+    {
+
+        var startIndex = 0;
+        while (line.Length > startIndex && line[startIndex] == '\t')
+        {
+            startIndex++;
+        }
+
+        int minLevelStartIndex;
+        if (!line.IsEmpty && char.IsDigit(line[startIndex]))
+        {
+            minLevelStartIndex = startIndex;
+        }
+        else
+        {
+            // skip label if any
+            minLevelStartIndex = line[startIndex..].IndexOf('\t') + startIndex + 1;
+        }
+
+        var minLevelEndIndex = line[minLevelStartIndex..].IndexOf('\t') + minLevelStartIndex;
+
+        var maxLevelStartIndex = line[minLevelEndIndex..].IndexOf('\t') + minLevelEndIndex + 1;
+        var maxLevelEndIndex = line[maxLevelStartIndex..].IndexOf('\t') + maxLevelStartIndex;
+
+        var percentageStartIndex = line[maxLevelEndIndex..].IndexOf('\t') + maxLevelEndIndex + 1;
+        var percentageEndIndex = line[percentageStartIndex..].IndexOf('\t') + percentageStartIndex;
+
+        var itemIdStartIndex = line[percentageEndIndex..].IndexOf('\t') + percentageEndIndex + 1;
+        var itemIdEndIndex = line[itemIdStartIndex..].IndexOf('\t') + itemIdStartIndex;
+
+        // special handling for last item
+        var outOfStartIndex = line[itemIdEndIndex..].IndexOf('\t') + itemIdEndIndex + 1;
+        var relativeOutOfEndIndex = line[outOfStartIndex..].IndexOf('\t');
+        var outOfEndIndex = relativeOutOfEndIndex == -1
+            ? line.Length
+            : relativeOutOfEndIndex + outOfStartIndex;
+
+        // if any end gave -1 it will be less than their relative start
+        if (minLevelEndIndex < minLevelStartIndex ||
+            maxLevelEndIndex < maxLevelStartIndex ||
+            percentageEndIndex < percentageStartIndex ||
+            itemIdEndIndex < itemIdStartIndex ||
+            outOfEndIndex < outOfStartIndex)
+        {
+            // chunk invalid
+            read = 0;
+            return null;
+        }
+
+        var minLevel = byte.Parse(line[minLevelStartIndex..minLevelEndIndex]);
+        var maxLevel = byte.Parse(line[maxLevelStartIndex..maxLevelEndIndex]);
+        var percentage =
+            float.Parse(line[percentageStartIndex..percentageEndIndex],
+                CultureInfo.InvariantCulture); // math percentage
+        var itemId = uint.Parse(line[itemIdStartIndex..itemIdEndIndex]);
+        var outOf = uint.Parse(
+            line[outOfStartIndex..outOfEndIndex]); // TODO: what to do with this value? Doesnt seem to be used, needs confirmation
+
+        read = outOfEndIndex + 1;
+
+        percentage *= 10000.0f; // because percentage here is 1 - 1000
+
+        return new CommonDropEntry(minLevel, maxLevel, itemId, percentage, rank);
+    }
+
+    private static bool IsEmptyOrContainsNewlineOrTab(string str)
+    {
+        return string.IsNullOrEmpty(str)
+               || str.Contains('\n')
+               || str.Contains('\t')
+               || str.Contains('{')
+               || str.Contains('}');
+    }
+
+    [DebuggerDisplay("{Name} | {Fields.Count} - {Data.Count}")]
+    public class DataFileGroup
+    {
+        public string Name { get; set; } = "";
+        public Dictionary<string, string> Fields { get; } = new(StringComparer.InvariantCultureIgnoreCase);
+#pragma warning disable CA1002 // do not use lists - hard to implement correctly right now
+        public List<List<string>> Data { get; } = new();
+#pragma warning restore CA1002
+
+        public T? GetField<T>(string key)
+        {
+            var foundKey = Fields.Keys.FirstOrDefault(k => k.Equals(key, StringComparison.InvariantCultureIgnoreCase));
+            if (foundKey is null)
+            {
+                return default;
+            }
+
+            var value = Fields[foundKey];
+            return (T)Convert.ChangeType(value, typeof(T));
+        }
+
+        public override string ToString()
+        {
+            var result = $"Group {Name}\n{{\n";
+            foreach (var field in Fields)
+            {
+                result += $"\t{field.Key}\t{field.Value}\n";
+            }
+
+            foreach (var datum in Data)
+            {
+                result += $"\t{string.Join("\t", datum)}\n";
+            }
+
+            result += "}\n";
+            return result;
+        }
+    }
+
+    [GeneratedRegex("(?: {2,}|\\t+)")]
+    private static partial Regex SplitByWhitespaceRegex();
+
+    [GeneratedRegex(@"\s+")]
+    private static partial Regex SplitByWhitespaceOrTabRegex();
+
+    [GeneratedRegex(@"^\d")]
+    private static partial Regex StartsWithNumberRegex();
+}

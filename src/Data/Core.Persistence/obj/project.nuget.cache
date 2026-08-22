@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "dgSpecHash": "/8xpyzmij9E=",
+  "success": true,
+  "projectFilePath": "F:\\GitHub\\quantum-core-x\\src\\Data\\Core.Persistence\\Core.Persistence.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Aymeric\\.nuget\\packages\\csharpisnullanalyzer\\0.1.593\\csharpisnullanalyzer.0.1.593.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.configuration\\10.0.11\\microsoft.extensions.configuration.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.configuration.abstractions\\10.0.11\\microsoft.extensions.configuration.abstractions.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.configuration.binder\\10.0.11\\microsoft.extensions.configuration.binder.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.dependencyinjection.abstractions\\10.0.11\\microsoft.extensions.dependencyinjection.abstractions.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.options\\10.0.11\\microsoft.extensions.options.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.options.configurationextensions\\10.0.11\\microsoft.extensions.options.configurationextensions.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.options.dataannotations\\10.0.11\\microsoft.extensions.options.dataannotations.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.extensions.primitives\\10.0.11\\microsoft.extensions.primitives.10.0.11.nupkg.sha512",
+    "C:\\Users\\Aymeric\\.nuget\\packages\\microsoft.visualstudio.threading.analyzers\\18.7.23\\microsoft.visualstudio.threading.analyzers.18.7.23.nupkg.sha512"
+  ],
+  "logs": []
+}

@@ -1,0 +1,51 @@
+﻿using AwesomeAssertions;
+using NSubstitute;
+using QuantumCore.API;
+using QuantumCore.API.Core.Models;
+using QuantumCore.API.Game.Types.Items;
+using QuantumCore.Game.PlayerUtils;
+
+namespace Game.Tests;
+
+public class InventoryTests
+{
+    [Fact]
+    public void SetEquipment_TriggersWearEvent()
+    {
+        var itemManager = Substitute.For<IItemManager>();
+        itemManager
+            .GetItem(Arg.Any<uint>())
+            .Returns(new ItemData { WearFlags = (uint)EWearFlags.BODY, Size = 1 });
+        var inv = new Inventory(itemManager,
+            Substitute.For<ICacheManager>(), Substitute.For<IItemRepository>(), 0, WindowType.INVENTORY, 1, 1,
+            1);
+        var changed = 0;
+        inv.OnSlotChanged += (_, _) => changed++;
+
+        var pos = (ushort)inv.EquipmentWindow.GetWearPosition(itemManager, 1);
+        inv.SetEquipment(new ItemInstance { ItemId = 1 }, pos);
+
+        inv.EquipmentWindow.Body!.ItemId.Should().Be(1);
+        changed.Should().Be(1);
+    }
+
+    [Fact]
+    public void RemoveEquipment_TriggersWearEvent()
+    {
+        var itemManager = Substitute.For<IItemManager>();
+        itemManager
+            .GetItem(Arg.Any<uint>())
+            .Returns(new ItemData { WearFlags = (uint)EWearFlags.BODY, Size = 1 });
+
+        var inv = new Inventory(itemManager,
+            Substitute.For<ICacheManager>(), Substitute.For<IItemRepository>(), 0, WindowType.INVENTORY, 1, 1,
+            1);
+        var changed = 0;
+        inv.OnSlotChanged += (_, _) => changed++;
+
+        inv.RemoveEquipment(new ItemInstance { Position = (ushort)(inv.Size + (int)EquipmentSlot.BODY) });
+
+        inv.EquipmentWindow.Body.Should().BeNull();
+        changed.Should().Be(1);
+    }
+}

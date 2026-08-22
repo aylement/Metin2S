@@ -1,0 +1,66 @@
+﻿using System.Security.Cryptography;
+using CommandLine;
+using Microsoft.Extensions.Logging;
+using QuantumCore.API;
+using QuantumCore.API.Game;
+using QuantumCore.API.Game.World;
+using QuantumCore.Game.Services;
+using QuantumCore.Game.World;
+using QuantumCore.Game.World.Entities;
+
+namespace QuantumCore.Game.Commands;
+
+[Command("mm", "Spawn a monster or npc on a random position on the current map")]
+public class SpawnMapRandomCommand : ICommandHandler<SpawnMapRandomCommandOptions>
+{
+    private readonly IMonsterManager _monsterManager;
+    private readonly IAnimationManager _animationManager;
+    private readonly IWorld _world;
+    private readonly ILogger<SpawnMapRandomCommand> _logger;
+    private readonly IDropProvider _dropProvider;
+    private readonly IServiceProvider _serviceProvider;
+
+    public SpawnMapRandomCommand(IMonsterManager monsterManager, IAnimationManager animationManager, IWorld world,
+        ILogger<SpawnMapRandomCommand> logger, IDropProvider dropProvider,
+        IServiceProvider serviceProvider)
+    {
+        _monsterManager = monsterManager;
+        _animationManager = animationManager;
+        _world = world;
+        _logger = logger;
+        _dropProvider = dropProvider;
+        _serviceProvider = serviceProvider;
+    }
+
+    public Task ExecuteAsync(CommandContext<SpawnMapRandomCommandOptions> context)
+    {
+        var proto = _monsterManager.GetMonster(context.Arguments.MonsterId);
+        if (proto is null)
+        {
+            context.Player.SendChatInfo("No monster found with the specified id");
+            return Task.CompletedTask;
+        }
+
+        var map = context.Player.Map!;
+        var x = RandomNumberGenerator.GetInt32((int)map.Position.X,
+            (int)(map.Position.X + (map.Width * Map.MAP_UNIT) + 1));
+        var y = RandomNumberGenerator.GetInt32((int)map.Position.Y,
+            (int)(map.Position.Y + (map.Height * Map.MAP_UNIT) + 1));
+
+        // Create entity instance
+        var monster = new MonsterEntity(_monsterManager, _dropProvider, _animationManager, _serviceProvider, map,
+            _logger, context.Arguments.MonsterId, x, y);
+        _world.SpawnEntity(monster);
+
+        var localX = (uint)((x - map.Position.X) / (float)Map.SPAWN_POSITION_MULTIPLIER);
+        var localY = (uint)((y - map.Position.Y) / (float)Map.SPAWN_POSITION_MULTIPLIER);
+        context.Player.SendChatInfo($"Monster spawned at ({localX}|{localY})");
+
+        return Task.CompletedTask;
+    }
+}
+
+public class SpawnMapRandomCommandOptions
+{
+    [Value(0, Required = true)] public uint MonsterId { get; set; }
+}

@@ -1,0 +1,57 @@
+using QuantumCore.API;
+using QuantumCore.API.Core.Models;
+using QuantumCore.API.Game.World;
+
+namespace QuantumCore.Game.Quest;
+
+[Quest]
+public class TestQuest : Quest
+{
+    private readonly IItemManager _itemManager;
+
+    public TestQuest(QuestState state, IPlayerEntity player, IItemManager itemManager) : base(state, player)
+    {
+        _itemManager = itemManager;
+    }
+
+    public override void Init()
+    {
+        // todo invent api for register npc click event on player
+        GameEventManager.RegisterNpcClickEvent("Test Quest", 20354, Player.Vid, TestAsync,
+            player => player.Vid == Player.Vid);
+        GameEventManager.RegisterNpcGiveEvent("Test Quest", 20016, Player.Vid,
+            async (player, item) => { await TestGiveAsync(player, item); }, (player, _) => player.Vid == Player.Vid);
+    }
+
+    private async Task TestAsync(IPlayerEntity player)
+    {
+        Text("Hello World from QuantumCore!");
+        Text("This is using the current work in progress");
+        Text("Quest API.");
+        await NextAsync();
+
+        Text("This is the second page showing how to easily");
+        Text("using await to wait for user response");
+        var choice = await ChoiceAsync(false, "1st option", "2nd option");
+
+        Text($"You've chosen: {choice}");
+        Done();
+    }
+
+    private async Task TestGiveAsync(IPlayerEntity player, ItemInstance item)
+    {
+        var proto = _itemManager.GetItem(item.ItemId);
+
+        if (proto is null)
+        {
+            Text("Failure: Could not find item.");
+        }
+        else
+        {
+            Text($"Thanks for giving me the item {proto.TranslatedName}.");
+            await player.Inventory.PlaceItemAsync(item);
+        }
+
+        Done();
+    }
+}

@@ -1,0 +1,38 @@
+﻿namespace QuantumCore.API.Game.Types.Skills;
+
+[Flags]
+public enum EAffectFlags
+{
+    NONE,
+    YMIR = 1 << 0,
+    INVISIBILITY = 1 << 1,
+    SPAWN = 1 << 2,
+    POISON = 1 << 3,
+    SLOW = 1 << 4,
+    STUN = 1 << 5,
+    DUNGEON_READY = 1 << 6,
+    FORCE_VISIBLE = 1 << 7,
+    BUILDING_CONSTRUCTION_SMALL = 1 << 8,
+    BUILDING_CONSTRUCTION_LARGE = 1 << 9,
+    BUILDING_UPGRADE = 1 << 10,
+    MOVEMENT_SPEED_POTION = 1 << 11,
+    ATTACK_SPEED_POTION = 1 << 12,
+    FISH_MIDE = 1 << 13,
+    JEONGWIHON = 1 << 14,
+    GEOMGYEONG = 1 << 15,
+    CHEONGEUN = 1 << 16,
+    GYEONGGONG = 1 << 17,
+    EUNHYUNG = 1 << 18,
+    GWIGUM = 1 << 19,
+    TERROR = 1 << 20,
+    JUMAGAP = 1 << 21,
+    HOSIN = 1 << 22,
+    BOHO = 1 << 23,
+    KWAESOK = 1 << 24,
+    MANASHIELD = 1 << 25,
+    MUYEONG = 1 << 26,
+    REVIVE_INVISIBLE = 1 << 27,
+    FIRE = 1 << 28,
+    GICHEON = 1 << 29,
+    JEUNGRYEOK = 1 << 30,
+}

@@ -1,0 +1,42 @@
+﻿using CommandLine;
+using QuantumCore.API.Game;
+using QuantumCore.API.Game.World;
+
+namespace QuantumCore.Game.Commands;
+
+[Command("kick", "Kick a player from the Server")]
+[Command("dc", "Kick a player from the Server")]
+public class KickCommand : ICommandHandler<KickCommandOptions>
+{
+    private readonly IWorld _world;
+
+    public KickCommand(IWorld world)
+    {
+        _world = world;
+    }
+
+    public async Task ExecuteAsync(CommandContext<KickCommandOptions> context)
+    {
+        if (context.Arguments.Target is null)
+        {
+            context.Player.SendChatMessage("No target given");
+            return;
+        }
+
+        var target = _world.GetPlayer(context.Arguments.Target);
+        if (target is not null)
+        {
+            await _world.DespawnPlayerAsync(target);
+            target.Disconnect();
+        }
+        else
+        {
+            context.Player.SendChatMessage("Target not found");
+        }
+    }
+}
+
+public class KickCommandOptions
+{
+    [Value(0, Required = true)] public string? Target { get; set; }
+}

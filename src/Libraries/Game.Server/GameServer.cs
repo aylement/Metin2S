@@ -1,0 +1,169 @@
+using System.Collections.Immutable;
+using System.Diagnostics.Metrics;
+using System.Reflection;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using QuantumCore.API;
+using QuantumCore.API.Core.Timekeeping;
+using QuantumCore.API.Game.Types;
+using QuantumCore.API.Game.World;
+using QuantumCore.API.PluginTypes;
+using QuantumCore.Core.Event;
+using QuantumCore.Core.Networking;
+using QuantumCore.Extensions;
+using QuantumCore.Networking;
+
+namespace QuantumCore.Game;
+
+public class GameServer : ServerBase<GameConnection>, IGameServer
+{
+    public static readonly Meter Meter = new Meter("QuantumCore:Game");
+    private readonly Histogram<double> _serverTimes = Meter.CreateHistogram<double>("TickTime", "ms");
+    private readonly ILogger<GameServer> _logger;
+    private readonly PluginExecutor _pluginExecutor;
+    private readonly ICommandManager _commandManager;
+    private readonly IWorld _world;
+
+    private ServerTimestamp _lastTick;
+    private TimeSpan _accumulatedElapsedTime;
+    private readonly TimeSpan _targetElapsedTime = TimeSpan.FromTicks(100000); // 100hz
+    private readonly TimeSpan _maxElapsedTime = TimeSpan.FromMilliseconds(500);
+
+    public new ImmutableArray<IGameConnection> Connections =>
+        [.. base.Connections.Values.Cast<IGameConnection>()];
+
+    public GameServer(
+        [FromKeyedServices(HostingOptions.MODE_GAME)]
+        IPacketManager packetManager, ILogger<GameServer> logger,
+        PluginExecutor pluginExecutor, IServiceProvider serviceProvider, ServerClock clock,
+        ICommandManager commandManager, IWorld world)
+        : base(packetManager, logger, pluginExecutor, serviceProvider, clock, HostingOptions.MODE_GAME)
+    {
+        _logger = logger;
+        _pluginExecutor = pluginExecutor;
+        _commandManager = commandManager;
+        _world = world;
+        _lastTick = Clock.Now;
+        Meter.CreateObservableGauge("Connections", () => Connections.Length);
+    }
+
+    private void Update(TickContext ctx)
+    {
+        EventSystem.Update(ctx);
+
+        _world.Update(ctx);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Load game data
+        var loadables = Scope.ServiceProvider.GetServices<ILoadable>().ToArray();
+        _logger.LogDebug("Loading loadables: {Loadables}", loadables.Select(x => x.GetType().Name));
+        await Task.WhenAll(loadables.Select(async x =>
+        {
+            try
+            {
+                await x.LoadAsync(stoppingToken);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e,
+                    "Loadable {Name} failed to load. This may or may not be an error. Please review it's error message",
+                    x.GetType().Name);
+            }
+        }));
+
+        await _world.InitAsync();
+
+        // Register all default commands
+        _commandManager.Register("QuantumCore.Game.Commands", Assembly.GetExecutingAssembly());
+        _commandManager.Register("QuantumCore.Game.Commands.Guild", Assembly.GetExecutingAssembly());
+
+        // Put all new connections into login phase
+        RegisterNewConnectionListener(connection =>
+        {
+            connection.SetPhase(EPhase.LOGIN);
+            return true;
+        });
+
+        StartListening();
+
+        _logger.LogInformation("Start listening for connections...");
+
+        _lastTick = Clock.Now;
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await _pluginExecutor.ExecutePluginsAsync<IGameTickListener>(_logger,
+                    x => x.PreUpdateAsync(stoppingToken));
+                await TickAsync(stoppingToken);
+                await _pluginExecutor.ExecutePluginsAsync<IGameTickListener>(_logger,
+                    x => x.PostUpdateAsync(stoppingToken));
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // Normal shutdown, don't log as error
+                break;
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Tick failed");
+            }
+        }
+
+        // No explicit "persist everyone" step needed here: stopping the host (via /shutdown's
+        // IHostApplicationLifetime.StopApplication(), which is what got a graceful stop working at all -
+        // taskkill without /F refuses on this project's console executables) cancels ServerBase's own
+        // stopping token, which each still-open GameConnection's read loop observes as an unexpected
+        // close and already runs GameConnection.OnCloseAsync(expected: false) -> World.DespawnPlayerAsync
+        // -> PlayerEntity.OnDespawnAsync()/PersistAsync() for it. An explicit loop was added here first,
+        // calling OnDespawnAsync() a second time per player - confirmed via a live EF Core
+        // "A second operation was started on this context instance" exception that both paths really do
+        // fire concurrently for the same player - so it was pure redundant duplication racing the
+        // connection's own path on the same DbContext, not something actually needed. Removed.
+    }
+
+    private async ValueTask TickAsync(CancellationToken stoppingToken)
+    {
+        var currentTick = Clock.Now;
+        var elapsedTime = Clock.ElapsedBetween(_lastTick, currentTick);
+        _lastTick = currentTick;
+
+        _serverTimes.Record(elapsedTime.TotalMilliseconds);
+        _accumulatedElapsedTime += elapsedTime;
+
+        if (_accumulatedElapsedTime < _targetElapsedTime)
+        {
+            var sleepTime = _targetElapsedTime - _accumulatedElapsedTime;
+            await Task.Delay(sleepTime, Clock.TimeProvider, stoppingToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Spiral of death prevention: https://gafferongames.com/post/fix_your_timestep/
+        // clamp at a maximum elapsed interval per tick
+        if (_accumulatedElapsedTime > _maxElapsedTime)
+        {
+            _logger.LogWarning("Server is running slow: tick delayed by {TotalMilliseconds:F2}ms",
+                (_accumulatedElapsedTime - _maxElapsedTime).TotalMilliseconds);
+            _accumulatedElapsedTime = _maxElapsedTime;
+        }
+
+        var stepCount = 0;
+
+        // Catch-up loop: may run multiple fixed updates if we fell behind
+        while (_accumulatedElapsedTime >= _targetElapsedTime)
+        {
+            _accumulatedElapsedTime -= _targetElapsedTime;
+            ++stepCount;
+
+            var stepTimestamp = Clock.Rewind(currentTick, _accumulatedElapsedTime);
+
+            //_logger.LogDebug($"Update... ({stepCount})");
+            Update(new TickContext(Clock, _targetElapsedTime, stepTimestamp));
+        }
+
+        // todo detect lags
+    }
+}

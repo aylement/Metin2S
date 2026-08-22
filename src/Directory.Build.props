@@ -1,0 +1,23 @@
+<Project>
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+        <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+        <LangVersion>latest</LangVersion>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <IsPackable>false</IsPackable>
+        <Authors>MeikelLP</Authors>
+    </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CSharpIsNullAnalyzer" Version="0.1.593">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+      <PackageReference Include="Microsoft.VisualStudio.Threading.Analyzers" Version="18.7.23">
+          <PrivateAssets>all</PrivateAssets>
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+      </PackageReference>
+  </ItemGroup>
+</Project>

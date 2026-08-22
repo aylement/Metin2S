@@ -1,0 +1,36 @@
+﻿using QuantumCore.API.Game.Guild;
+using QuantumCore.API.Game.Types.Guild;
+using QuantumCore.API.Game.World;
+
+namespace QuantumCore.Game.Extensions;
+
+public static class GuildExtensions
+{
+    public static EGuildJoinStatusCode CanJoinGuild(this GuildData guild, IPlayerEntity invitee)
+    {
+        ArgumentNullException.ThrowIfNull(guild);
+        ArgumentNullException.ThrowIfNull(invitee);
+        // TODO check if player has recently left any guild
+        // TODO check if player has recently dissolved any guild
+        if (invitee.Player.GuildId is not null)
+        {
+            return EGuildJoinStatusCode.ALREADY_IN_ANY_GUILD;
+        }
+
+        if (guild.Members.Length >= guild.MaxMemberCount)
+        {
+            return EGuildJoinStatusCode.GUILD_FULL;
+        }
+
+        return EGuildJoinStatusCode.SUCCESS;
+    }
+
+    // TODO cache
+    public static IEnumerable<IPlayerEntity> GetGuildMembers(this IWorld world, uint guildId)
+    {
+        ArgumentNullException.ThrowIfNull(world);
+        var allPlayers = world.GetPlayers();
+        return allPlayers
+            .Where(p => p.Player.GuildId == guildId);
+    }
+}

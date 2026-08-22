@@ -1,0 +1,10 @@
+﻿using QuantumCore.Networking;
+
+namespace QuantumCore.API.Packets;
+
+[Packet(0x1B, EDirection.OUTGOING)]
+[PacketGenerator]
+public partial class GroundItemRemove
+{
+    [Field(0)] public uint Vid { get; set; }
+}

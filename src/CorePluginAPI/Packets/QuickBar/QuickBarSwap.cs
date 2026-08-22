@@ -1,0 +1,11 @@
+using QuantumCore.Networking;
+
+namespace QuantumCore.API.Packets.QuickBar;
+
+[Packet(0x12, EDirection.INCOMING, Sequence = true)]
+[PacketGenerator]
+public partial class QuickBarSwap
+{
+    [Field(0)] public byte Position1 { get; set; }
+    [Field(1)] public byte Position2 { get; set; }
+}

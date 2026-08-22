@@ -1,0 +1,37 @@
+﻿using System.Collections.Immutable;
+using QuantumCore.API.Core.Models;
+using QuantumCore.API.Core.Timekeeping;
+
+namespace QuantumCore.API.Game.World;
+
+public interface IWorld : ILoadable
+{
+    Task InitAsync();
+    void Update(TickContext ctx);
+    IMap? GetMapAt(uint x, uint y);
+    IMap? GetMapByName(string name);
+    ImmutableArray<IMap> FindMapsByName(string needle);
+    CoreHost GetMapHost(int x, int y);
+    SpawnGroup? GetGroup(uint id);
+    SpawnGroup GetRandomGroup();
+    SpawnGroupCollection? GetGroupCollection(uint id);
+    void SpawnEntity(IEntity e);
+
+    /// <summary>
+    /// This will immediately despawn an entity. However, it does not trigger persistence for players. Please use
+    /// <see cref="DespawnPlayerAsync"/> for this.
+    /// </summary>
+    /// <param name="entity"></param>
+    void DespawnEntity(IEntity entity);
+
+    /// <summary>
+    /// Despawns a player and waits for persistence to be finished before returning
+    /// </summary>
+    Task DespawnPlayerAsync(IPlayerEntity player);
+
+    uint GenerateVid();
+    void RemovePlayer(IPlayerEntity e);
+    IPlayerEntity? GetPlayer(string playerName);
+    IList<IPlayerEntity> GetPlayers();
+    IPlayerEntity? GetPlayerById(uint playerId);
+}

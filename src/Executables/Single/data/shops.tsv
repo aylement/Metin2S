@@ -1,0 +1,32 @@
+vnum	name	npc_vnum
+1	Weapon Shop Dealer	9001
+2	Fisherman	9009
+3	General Store Saleswoman	9003
+4	Armour Shop Dealer	9002
+5	Weapon Shop Dealer 2	9007
+6	Armour Shop Dealer 2	9008
+7	gold_bar_shop	9005
+8	firework_shop	9004
+9	Peddler	20042
+10	pick_shop	20015
+11	Stable Boy	20349
+1001	all_sword	0
+1002	all_dualhand_sword	0
+1003	all_bow	0
+1004	all_twohand_sword	0
+1005	all_bell	0
+1006	all_fan	0
+1007	all_warrior_armour	0
+1008	all_assassin_armour	0
+1009	all_sura_armour	0
+1010	all_shaman_armour	0
+1011	all_warrior_helmet	0
+1012	all_assassin_helmet	0
+1013	all_sura_helmet	0
+1014	all_shaman_helmet	0
+1015	all_shield	0
+1016	all_bracelet	0
+1017	all_shoe	0
+1018	all_necklace	0
+1019	all_ring	0
+13	Alchemist	20001

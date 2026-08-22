@@ -1,0 +1,13 @@
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\bin\Debug\net10.0\Core.Persistence.deps.json
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\bin\Debug\net10.0\Core.Persistence.dll
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\bin\Debug\net10.0\Core.Persistence.pdb
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.csproj.AssemblyReference.cache
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.GeneratedMSBuildEditorConfig.editorconfig
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.AssemblyInfoInputs.cache
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.AssemblyInfo.cs
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.csproj.CoreCompileInputs.cache
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.sourcelink.json
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.dll
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\refint\Core.Persistence.dll
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\Core.Persistence.pdb
+F:\GitHub\quantum-core-x\src\Data\Core.Persistence\obj\Debug\net10.0\ref\Core.Persistence.dll

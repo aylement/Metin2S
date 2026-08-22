@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <IsPackable>false</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <PackageReference Include="AwesomeAssertions" Version="9.5.0"/>
+        <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.11"/>
+      <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.9.0"/>
+        <PackageReference Include="NSubstitute" Version="6.2.0"/>
+        <PackageReference Include="Serilog.Extensions.Hosting" Version="10.0.0"/>
+      <PackageReference Include="Testcontainers.MySql" Version="4.14.0"/>
+      <PackageReference Include="Testcontainers.Redis" Version="4.14.0"/>
+      <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0">
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+            <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
+      <PackageReference Include="coverlet.collector" Version="10.0.1">
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+            <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
+        <PackageReference Include="xunit.v3" Version="4.0.0"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\Core\Core.csproj"/>
+        <ProjectReference Include="..\..\Data\Auth.Persistence\Auth.Persistence.csproj"/>
+      <ProjectReference Include="..\..\Data\Core.Caching\Core.Caching.csproj" />
+    </ItemGroup>
+
+</Project>

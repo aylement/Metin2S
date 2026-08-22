@@ -1,0 +1,13 @@
+F:\GitHub\quantum-core-x\src\ServiceDefaults\bin\Debug\net10.0\ServiceDefaults.deps.json
+F:\GitHub\quantum-core-x\src\ServiceDefaults\bin\Debug\net10.0\ServiceDefaults.dll
+F:\GitHub\quantum-core-x\src\ServiceDefaults\bin\Debug\net10.0\ServiceDefaults.pdb
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.csproj.AssemblyReference.cache
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.GeneratedMSBuildEditorConfig.editorconfig
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.AssemblyInfoInputs.cache
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.AssemblyInfo.cs
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.csproj.CoreCompileInputs.cache
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.sourcelink.json
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.dll
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\refint\ServiceDefaults.dll
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ServiceDefaults.pdb
+F:\GitHub\quantum-core-x\src\ServiceDefaults\obj\Debug\net10.0\ref\ServiceDefaults.dll

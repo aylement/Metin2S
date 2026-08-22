@@ -1,0 +1,22 @@
+﻿using QuantumCore.API;
+using QuantumCore.API.Game;
+using QuantumCore.API.Game.World;
+
+namespace QuantumCore.Game.Commands;
+
+[Command("help", "Shows this help message")]
+[CommandNoPermission]
+public static class HelpCommand
+{
+    [CommandMethod]
+    public static Task HelpAsync(IPlayerEntity player, ICommandManager commandManager, int page = 1)
+    {
+        throw new NotImplementedException();
+    }
+
+    [CommandMethod("Shows an help with a specific command")]
+    public static Task HelpWithCommandAsync(IPlayerEntity player, ICommandManager commandManager, string command)
+    {
+        throw new NotImplementedException();
+    }
+}

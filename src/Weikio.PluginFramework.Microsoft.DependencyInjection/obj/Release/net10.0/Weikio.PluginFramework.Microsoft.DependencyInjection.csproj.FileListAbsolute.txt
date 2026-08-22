@@ -1,0 +1,13 @@
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\bin\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.deps.json
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\bin\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.dll
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\bin\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.pdb
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.csproj.AssemblyReference.cache
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.GeneratedMSBuildEditorConfig.editorconfig
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.AssemblyInfoInputs.cache
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.AssemblyInfo.cs
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.csproj.CoreCompileInputs.cache
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.sourcelink.json
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.dll
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\refint\Weikio.PluginFramework.Microsoft.DependencyInjection.dll
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\Weikio.PluginFramework.Microsoft.DependencyInjection.pdb
+F:\GitHub\quantum-core-x\src\Weikio.PluginFramework.Microsoft.DependencyInjection\obj\Release\net10.0\ref\Weikio.PluginFramework.Microsoft.DependencyInjection.dll
