@@ -445,6 +445,14 @@ internal sealed class DropProvider : IDropProvider, ILoadable
 
         foreach (var levelDrop in levelDrops)
         {
+            // mob_drop_item.txt's "limit" groups are per-monster (each has its own "Mob" field, e.g. "at
+            // level 75+, THIS specific mob also drops these") - not a level-wide bonus table shared by every
+            // monster in the game. Without this check every kill rolled through every level-eligible "limit"
+            // group in the whole file (~90 of them at max level), regardless of what was actually killed -
+            // confirmed live as the cause of way too many items dropping per kill. Same class of bug as the
+            // common_drop_item.txt rank filter above.
+            if (levelDrop.MonsterProtoId != monster.Proto.Id) continue;
+
             foreach (var drop in levelDrop.Drops)
             {
                 var percent = drop.Chance;

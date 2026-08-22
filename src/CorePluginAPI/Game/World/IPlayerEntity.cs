@@ -64,6 +64,15 @@ public interface IPlayerEntity : IEntity
     Task SetItemAsync(ItemInstance item, WindowType window, ushort position);
     void Disconnect();
     Task OnDespawnAsync();
+
+    /// <summary>
+    /// Persists this player's current state (position, quick slot bar, skills) without despawning them -
+    /// unlike <see cref="OnDespawnAsync"/>, safe to call periodically on a still-connected player. Used for
+    /// periodic autosave (see <c>Game:AutoSaveIntervalSeconds</c>) so a forceful server termination (a
+    /// crash, or an operator killing the process without a graceful shutdown) loses at most one interval's
+    /// worth of progress instead of everything since the player's last disconnect.
+    /// </summary>
+    Task SaveAsync();
     Task CalculatePlayedTimeAsync();
     int GetMobItemRate();
     bool HasUniqueItemEquipped(uint itemProtoId);

@@ -445,7 +445,21 @@ public abstract class Entity : IEntity
             {
                 isCritical = true;
                 damage *= 2;
-                // todo send effect to clients
+
+                // Real client behaviour (SPacketGCSpecialEffect / SE_CRITICAL, char.cpp::EffectPacket): a
+                // dedicated packet, separate from DamageInfo below, attaches a visual (yellow flash) to the
+                // VICTIM ("this", not the attacker) and is broadcast to every nearby player, not just the
+                // two combatants - so bystanders see it too. This is NOT the same thing as the
+                // DamageInfo.DamageFlags.CRITICAL bit sent further down: that flag exists in the real
+                // protocol too, but the client's own DAMAGE_CRITICAL branch in ProcessDamage() only ever
+                // triggers a minor particle burst next to the floating damage number, not the flash the
+                // player actually remembers - this SpecialEffect packet is what triggers that.
+                var criticalEffect = new SpecialEffect { Type = ESpecialEffectType.CRITICAL, Vid = Vid };
+                foreach (var player in NearbyEntities.Where(x => x is IPlayerEntity).Cast<IPlayerEntity>())
+                {
+                    player.Connection.Send(criticalEffect);
+                }
+
                 SendDebugDamage(attacker,
                     $"{attacker}->{this} Critical hit -> {damage} (percentage was {criticalPercentage})");
             }

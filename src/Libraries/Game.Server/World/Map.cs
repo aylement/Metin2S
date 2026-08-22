@@ -426,6 +426,13 @@ public class Map : IMap
         _pendingSpawns.Enqueue(entity);
     }
 
+    // Real client/server default (CItem::StartDestroyEvent(int iSec=300) in the original item.cpp) - ground
+    // items that are never picked up disappear after 5 minutes. Was never implemented here at all: nothing
+    // ever called Map.DespawnEntity for a dropped item, so ground items piled up forever for the lifetime of
+    // the server process, dragging down client FPS the more kills accumulated. Picking the item up still
+    // despawns it immediately (PlayerEntity.PickupAsync) - this timer only covers the "never picked up" case.
+    private static readonly TimeSpan GroundItemLifetime = TimeSpan.FromSeconds(300);
+
     /// <summary>
     /// Add a ground item which will automatically get destroyed after configured time
     /// </summary>
@@ -442,6 +449,18 @@ public class Map : IMap
         };
 
         SpawnEntity(groundItem);
+
+        EventSystem.EnqueueEvent(() =>
+        {
+            // Already picked up (or otherwise removed) in the meantime - _entities.Remove is a no-op then,
+            // but skip the whole despawn dance if we can tell up front.
+            if (_entities.Contains(groundItem))
+            {
+                DespawnEntity(groundItem);
+            }
+
+            return TimeSpan.Zero;
+        }, GroundItemLifetime);
     }
 
     /// <summary>

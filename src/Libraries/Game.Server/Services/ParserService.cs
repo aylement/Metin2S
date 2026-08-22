@@ -353,6 +353,7 @@ public partial class ParserService : IParserService
 
             return new LevelItemGroup
             {
+                MonsterProtoId = monsterProtoId,
                 LevelLimit = levelLimit,
                 Drops = [.. drops]
             };

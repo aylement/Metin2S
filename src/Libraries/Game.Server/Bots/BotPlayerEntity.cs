@@ -49,11 +49,19 @@ public class BotPlayerEntity : PlayerEntity
     // way - this is purely about pacing how often the real effect - damage/buff - fires).
     private static readonly TimeSpan SkillAttemptCooldown = TimeSpan.FromSeconds(7);
 
-    // A real combo's length/animation is picked by each OBSERVING client from its own per-race/weapon
-    // motion data (CRaceData::TComboData::ComboIndexVector, RaceMotionData.cpp) using the Argument byte we
-    // send as the combo step index - we don't have that per-weapon table parsed out, so 3 is used as a
-    // conservative, common basic-weapon combo length rather than a value read from real game data.
-    private const byte ComboMaxIndex = 3;
+    // The Argument byte for a FUNC_COMBO packet is NOT a simple 0/1/2/3 step counter - confirmed via the
+    // real client source (GameLib/RaceMotionData.h's CRaceMotionData::EName, a plain unscoped enum with no
+    // manual value overrides, so it's numbered sequentially and identically for every race/weapon - not
+    // per-race data): it's one of the universal NAME_COMBO_ATTACK_1..8 constants (14..21, since
+    // NAME_NORMAL_ATTACK=13 is the entry right before them). The receiving client resolves this via
+    // CRaceData::GetMotionKey(mode, wMotionIndex, ...), which looks the value up directly in that race's
+    // registered MotionVectorMap - so sending the real constant (not an arbitrary small int) is what makes
+    // GetMotionKey actually find a match instead of silently failing. 8 steps is the real, verified length
+    // for at least Assassin/dualhand_sword (F:\GitHub\ClientMT2\Extractions\PC\...\dualhand_sword has
+    // combo_01..combo_08.msa, no plain "attack" motion at all) - other class/weapon combos may register
+    // fewer, in which case only the later steps in a chain would fail to resolve, not the whole system.
+    private const byte NameComboAttack1 = 14; // CRaceMotionData::NAME_COMBO_ATTACK_1
+    private const byte ComboStepCount = 8; // NAME_COMBO_ATTACK_1..8, see doc comment above
 
     // Level-~80-90, +9 refined, PER-CLASS gear matching the bot's own level (BotPlayerDataFactory sets
     // Level=90) - verified against this repo's actual src/Executables/Single/data/item_proto, including
@@ -101,7 +109,7 @@ public class BotPlayerEntity : PlayerEntity
     private MonsterEntity? _target;
     private TimeSpan _attackCooldownRemaining;
     private TimeSpan _skillAttemptCooldownRemaining;
-    private byte _comboIndex; // 0 = next hit starts a fresh FUNC_ATTACK instead of continuing a FUNC_COMBO
+    private byte _comboIndex; // 0 = next hit starts a fresh combo chain (still FUNC_COMBO - see BroadcastAttack)
 
     public BotPlayerEntity(PlayerData player, IGameConnection connection, IItemManager itemManager,
         IJobManager jobManager, IExperienceManager experienceManager, IAnimationManager animationManager,
@@ -230,7 +238,7 @@ public class BotPlayerEntity : PlayerEntity
         if (_target is not null && (_target.Dead || _target.Map != Map || this.DistanceTo(_target) > GiveUpRange))
         {
             _target = null;
-            _comboIndex = 0; // a fresh engagement later starts with a plain attack, not mid-combo
+            _comboIndex = 0; // a fresh engagement later starts a new combo chain from step 0
         }
 
         _target ??= FindTarget();
@@ -274,19 +282,15 @@ public class BotPlayerEntity : PlayerEntity
             BroadcastStop(ctx);
         }
 
-        // BroadcastAttack() DISABLED AGAIN - live-tested on n_flame_01 (the new volcano map) and the bot
-        // hard-froze in place from its very first attack onward (no idle/walk animation either, not just a
-        // missing swing) - the exact original symptom this project hit long before the Stop()/
-        // BroadcastStop() position-correction fix above existed (see bot-feature-overview memory: "the
-        // hard freeze is gone" was the conclusion of the SECOND round of testing, on the starter town maps
-        // only). Never re-isolated why it's back now (new map's terrain/height data is the prime suspect -
-        // untested on a1/b1/c1 with this exact bot setup - but the level-90 gear and no-longer-auto-mounted
-        // default changed too, all at once, so nothing here is confirmed). Given a frozen statue is a worse
-        // outcome for "wandering, lively bots" than simply not showing a swing (which was already the case
-        // either way - no version of this has ever produced a visible swing), reverting to the safe,
-        // previously-validated baseline: no ATTACK/COMBO packet at all. Damage still applies normally via
-        // Entity.Damage()/DamageInfo below, only the animation packet is skipped.
-        // BroadcastAttack(ctx);
+        // RE-ENABLED for a live instrumented test (2026-08-22) - now that the client itself is buildable,
+        // added file-based trace logging (C:\qcx_client_debug.log) at the exact decision points in the
+        // real client source (InstanceBase.cpp's FUNC_ATTACK case, RunNormalAttack, NormalAttack's
+        // GetNormalAttackIndex check - see [[client-server-original-source]]) instead of theorizing further
+        // from just reading code. TEST ON A STARTER TOWN MAP (a1/b1/c1), NOT n_flame_01 - that specific map
+        // is where the hard freeze was previously observed; the starter towns have only ever shown "no
+        // animation, no freeze" so far, a much safer place to gather a first trace. If it still hard-freezes
+        // even there, at least the log lines already written before the freeze will show how far it got.
+        BroadcastAttack(ctx);
 
         // A real player's sword swing hits everyone in a forward cone, not just the locked target - the
         // client computes that cone and sends one Attack packet per hit; since a bot has no client we
@@ -448,31 +452,31 @@ public class BotPlayerEntity : PlayerEntity
     /// </summary>
     private void BroadcastAttack(TickContext ctx)
     {
-        CharacterMovementType movementType;
-        byte argument;
-
-        if (_comboIndex == 0)
+        // ROOT CAUSE FOUND 2026-08-22 via live client instrumentation (temporary trace logging in
+        // InstanceBase.cpp's FUNC_ATTACK case / RunNormalAttack / NormalAttack, see
+        // [[client-server-original-source]]): CharacterMovementType.ATTACK was NEVER correct here, for ANY
+        // hit - confirmed both by a live trace (RunNormalAttack always returned FALSE, motionMode=4/
+        // MODE_DUALHAND_SWORD - no motion ever registered for it) and by reading the real client's own
+        // input handler, CInstanceBase::NEW_Attack (InstanceBaseBattle.cpp): a normal (non-polymorphed)
+        // character ALWAYS calls InputComboAttack, never InputNormalAttack, mounted or not - FUNC_ATTACK/
+        // RunNormalAttack is dead code for any real player outside of polymorph, since only the generic/
+        // monster race loader (RaceManager.cpp) ever calls RegisterNormalAttack, and only for MODE_GENERAL.
+        // The engagement's first hit is NOT a special "plain attack" case (the old comment here was wrong)
+        // - InputComboAttackCommand's own state machine starts m_dwcurComboIndex at 0 and treats THAT as
+        // the trigger for the first combo step too (__RunNextCombo()), so every hit, first included, is a
+        // COMBO packet from the real client's perspective.
+        // _comboIndex is kept 0-based internally (0..ComboStepCount-1); translated to the real
+        // NAME_COMBO_ATTACK_N wire constant just below.
+        var argument = (byte)(NameComboAttack1 + _comboIndex);
+        _comboIndex++;
+        if (_comboIndex >= ComboStepCount)
         {
-            // First hit of a fresh engagement - a real client always starts with a plain attack, never a
-            // combo step.
-            movementType = CharacterMovementType.ATTACK;
-            argument = 0;
-            _comboIndex = 2; // the next hit continues the combo at step 2
-        }
-        else
-        {
-            movementType = CharacterMovementType.COMBO;
-            argument = _comboIndex;
-            _comboIndex++;
-            if (_comboIndex > ComboMaxIndex)
-            {
-                _comboIndex = 0; // combo finished - next hit starts a fresh attack, like a real client does
-            }
+            _comboIndex = 0; // combo finished - next hit starts a fresh chain, like a real client does
         }
 
         Broadcast(new CharacterMoveOut
         {
-            MovementType = movementType,
+            MovementType = CharacterMovementType.COMBO,
             Argument = argument,
             Rotation = (byte)(Rotation / 5),
             Vid = Vid,

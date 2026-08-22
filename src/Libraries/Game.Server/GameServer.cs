@@ -3,6 +3,7 @@ using System.Diagnostics.Metrics;
 using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using QuantumCore.API;
 using QuantumCore.API.Core.Timekeeping;
 using QuantumCore.API.Game.Types;
@@ -11,6 +12,7 @@ using QuantumCore.API.PluginTypes;
 using QuantumCore.Core.Event;
 using QuantumCore.Core.Networking;
 using QuantumCore.Extensions;
+using QuantumCore.Game.Extensions;
 using QuantumCore.Networking;
 
 namespace QuantumCore.Game;
@@ -23,6 +25,7 @@ public class GameServer : ServerBase<GameConnection>, IGameServer
     private readonly PluginExecutor _pluginExecutor;
     private readonly ICommandManager _commandManager;
     private readonly IWorld _world;
+    private readonly GameOptions _options;
 
     private ServerTimestamp _lastTick;
     private TimeSpan _accumulatedElapsedTime;
@@ -36,15 +39,29 @@ public class GameServer : ServerBase<GameConnection>, IGameServer
         [FromKeyedServices(HostingOptions.MODE_GAME)]
         IPacketManager packetManager, ILogger<GameServer> logger,
         PluginExecutor pluginExecutor, IServiceProvider serviceProvider, ServerClock clock,
-        ICommandManager commandManager, IWorld world)
+        ICommandManager commandManager, IWorld world, IOptions<GameOptions> options)
         : base(packetManager, logger, pluginExecutor, serviceProvider, clock, HostingOptions.MODE_GAME)
     {
+        ArgumentNullException.ThrowIfNull(options);
         _logger = logger;
         _pluginExecutor = pluginExecutor;
         _commandManager = commandManager;
         _world = world;
+        _options = options.Value;
         _lastTick = Clock.Now;
         Meter.CreateObservableGauge("Connections", () => Connections.Length);
+    }
+
+    private async Task AutoSavePlayerAsync(IPlayerEntity player)
+    {
+        try
+        {
+            await player.SaveAsync();
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Autosave failed for player {Name}", player.Name);
+        }
     }
 
     private void Update(TickContext ctx)
@@ -74,6 +91,31 @@ public class GameServer : ServerBase<GameConnection>, IGameServer
         }));
 
         await _world.InitAsync();
+
+        // Periodic autosave - independent of any disconnect. Without this, the ONLY time a connected
+        // player's state gets persisted is on disconnect (PlayerEntity.OnDespawnAsync), so a forceful
+        // process kill (crash, or an operator skipping the graceful /shutdown path) loses everything since
+        // the player's last disconnect - confirmed a real, repeated annoyance during live testing. Reuses
+        // EventSystem's own repeat mechanism (returning a non-zero TimeSpan reschedules) - same pattern as
+        // Map.AddGroundItem's despawn timer. AutoSaveIntervalSeconds <= 0 disables it entirely.
+        if (_options.AutoSaveIntervalSeconds > 0)
+        {
+            var interval = TimeSpan.FromSeconds(_options.AutoSaveIntervalSeconds);
+            EventSystem.EnqueueEvent(() =>
+            {
+                foreach (var player in _world.GetPlayers())
+                {
+                    // Fire-and-forget per player deliberately NOT awaited here - EventSystem.Update() runs
+                    // synchronously as part of the game tick, so blocking it on DB writes for every
+                    // connected player would stall the whole server each interval. AutoSavePlayerAsync
+                    // catches its own exceptions so this isn't the same silent-swallow bug fixed elsewhere
+                    // this session (Connection.Close()'s old `_ = OnCloseAsync(...)`).
+                    _ = AutoSavePlayerAsync(player);
+                }
+
+                return interval;
+            }, interval);
+        }
 
         // Register all default commands
         _commandManager.Register("QuantumCore.Game.Commands", Assembly.GetExecutingAssembly());

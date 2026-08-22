@@ -74,8 +74,10 @@ public class MonsterItemGroup : MonsterDropContainer
             return null;
         }
 
+        // GetOneIndex() returns a 1-based distance counted from the end of the list
+        // (matches the original game's algorithm), not a 0-based index from the start.
         var index = GetOneIndex();
-        return _drops[index];
+        return _drops[_drops.Count - index];
     }
 }
 
@@ -101,6 +103,7 @@ public class LevelItemGroup : MonsterDropContainer
         public float Chance { get; init; }
     }
 
+    public uint MonsterProtoId { get; init; }
     public uint LevelLimit { get; init; }
     public ImmutableArray<Drop> Drops { get; init; } = [];
 }

@@ -501,6 +501,28 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
         AttackSpeed = (byte)Math.Clamp(AttackSpeed + GetSkillBuff(EPoint.ATTACK_SPEED), 0, byte.MaxValue);
     }
 
+    /// <summary>
+    /// Sums a fixed item-proto Apply value (e.g. CRITICAL_PCT) across every currently equipped item - same
+    /// aggregation CalculateMovement()/CalculateAttackSpeed() already do for MOV_SPEED/ATTACK_SPEED, just
+    /// not cached in a field since callers here (GetPoint's CRITICAL_PERCENTAGE/RESIST_CRITICAL cases) are
+    /// only evaluated once per hit, not every tick.
+    /// </summary>
+    private int GetEquipmentApplySum(EApplyType type)
+    {
+        var sum = 0;
+        foreach (var slot in Enum.GetValues<EquipmentSlot>())
+        {
+            var item = Inventory.EquipmentWindow.GetItem(slot);
+            if (item is null) continue;
+            var proto = _itemManager.GetItem(item.ItemId);
+            if (proto is null) continue;
+
+            sum += proto.GetApplyValue(type);
+        }
+
+        return sum;
+    }
+
     public override void Die()
     {
         if (Dead)
@@ -1090,6 +1112,25 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
             case EPoint.DEFENCE:
             case EPoint.DEFENCE_GRADE:
                 return (uint)Math.Max(0, _defence + GetSkillBuff(EPoint.DEFENCE_GRADE));
+            // Was missing entirely (fell through to the generic `default: return 0`) - Entity.Damage()'s
+            // `if (criticalPercentage > 0)` gate meant crits could never proc for ANY player regardless of
+            // gear, even with an item-granted CRITICAL_PCT apply (e.g. "+15% Critical Hit"). That apply
+            // value is real, fixed item-proto data (ItemExtensions.GetApplyValue), not a random per-instance
+            // roll this repo lacks - same class of fix already done for MOV_SPEED/ATTACK_SPEED above.
+            case EPoint.CRITICAL_PERCENTAGE:
+                return (uint)Math.Max(0, GetEquipmentApplySum(EApplyType.CRITICAL_PCT));
+            case EPoint.RESIST_CRITICAL:
+                return (uint)Math.Max(0, GetEquipmentApplySum(EApplyType.ANTI_CRITICAL_PCT));
+            // Same bug, same fix as CRITICAL_PERCENTAGE/RESIST_CRITICAL above - was falling through to the
+            // generic `default: return 0`, so Entity.Damage()'s `if (penetratePercentage > 0)` gate meant
+            // penetrate could never proc regardless of an item's PENETRATE_PCT apply. Confirmed live via the
+            // repeated "Point PENETRATE_PERCENTAGE is not implemented on monster" log spam (that specific
+            // warning is harmless/expected - it's MonsterEntity.GetPoint, not this one - but its constant
+            // presence is what prompted checking this player-side case, which really was missing).
+            case EPoint.PENETRATE_PERCENTAGE:
+                return (uint)Math.Max(0, GetEquipmentApplySum(EApplyType.PENETRATE_PCT));
+            case EPoint.RESIST_PENETRATE:
+                return (uint)Math.Max(0, GetEquipmentApplySum(EApplyType.ANTI_PENETRATE_PCT));
             case EPoint.STATUS_POINTS:
                 return Player.AvailableStatusPoints;
             case EPoint.PLAY_TIME:
@@ -1102,6 +1143,9 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
                 return 0;
         }
     }
+
+    /// <inheritdoc />
+    public Task SaveAsync() => PersistAsync();
 
     private async Task PersistAsync()
     {
@@ -1240,10 +1284,16 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
 
     public int GetMobItemRate()
     {
-        // todo: implement server rates, and premium server rates
-        if (GetPremiumRemainSeconds(EPremiumType.ITEM) > 0)
-            return 100;
-        return 100_000_000;
+        // todo: implement configurable server-wide item drop rates, and premium server rates
+        // This used to return 100_000_000 (a million times the intended neutral 100) for every player
+        // without an active premium item bonus - i.e. always, since GetPremiumRemainSeconds is itself
+        // a stub that always returns 0. DropProvider.CalculateDropPercentages multiplies deltaPercentage
+        // by this value / 100, so every single drop roll across every category (common/group/kill/limit/
+        // etc/metin) was inflated a millionfold - confirmed live via debug logging showing individual drop
+        // chances of several hundred to tens of thousands of percent (guaranteed drops) instead of the
+        // intended sub-1% values. 100 is the neutral "normal rate" baseline until real configurable
+        // server/premium rates are implemented.
+        return 100;
     }
 
     public int GetPremiumRemainSeconds(EPremiumType type)

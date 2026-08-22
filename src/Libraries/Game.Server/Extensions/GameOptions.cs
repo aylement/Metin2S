@@ -20,6 +20,15 @@ public class GameOptions
     public SkillsOptions Skills { get; set; } = new SkillsOptions();
 
     public DropOptions Drops { get; set; } = new DropOptions();
+
+    /// <summary>
+    /// How often (in seconds) every connected player's state gets persisted in the background, independent
+    /// of disconnect. There was no such mechanism at all before this - saves only ever happened on
+    /// disconnect (<see cref="QuantumCore.Game.World.Entities.PlayerEntity.OnDespawnAsync"/>), so a
+    /// forceful process kill (crash, or an operator not going through a graceful shutdown) lost everything
+    /// since the player's last disconnect. 60s by default; set to 0 to disable autosave entirely.
+    /// </summary>
+    public int AutoSaveIntervalSeconds { get; set; } = 60;
 }
 
 public class DropOptions
