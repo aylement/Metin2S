@@ -1,9 +1,0 @@
-﻿<?xml version="1.0" encoding="utf-8" standalone="no"?>
-<Project ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <ImportGroup Condition=" '$(ExcludeRestorePackageImports)' != 'true' ">
-    <Import Project="$(NuGetPackageRoot)microsoft.visualstudio.threading.analyzers\18.7.23\buildTransitive\Microsoft.VisualStudio.Threading.Analyzers.targets" Condition="Exists('$(NuGetPackageRoot)microsoft.visualstudio.threading.analyzers\18.7.23\buildTransitive\Microsoft.VisualStudio.Threading.Analyzers.targets')" />
-    <Import Project="$(NuGetPackageRoot)sqlite\3.53.4\buildTransitive\net9.0\SQLite.targets" Condition="Exists('$(NuGetPackageRoot)sqlite\3.53.4\buildTransitive\net9.0\SQLite.targets')" />
-    <Import Project="$(NuGetPackageRoot)serilog\4.4.0\buildTransitive\Serilog.targets" Condition="Exists('$(NuGetPackageRoot)serilog\4.4.0\buildTransitive\Serilog.targets')" />
-    <Import Project="$(NuGetPackageRoot)gitversion.msbuild\6.8.2\build\GitVersion.MsBuild.targets" Condition="Exists('$(NuGetPackageRoot)gitversion.msbuild\6.8.2\build\GitVersion.MsBuild.targets')" />
-  </ImportGroup>
-</Project>

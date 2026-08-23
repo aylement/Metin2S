@@ -1,0 +1,17 @@
+# Build artifacts
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio / Rider local state
+.vs/
+.idea/
+*.user
+*.suo
+
+# Runtime data - keep the seeded database.db itself tracked (Initial commit ships it pre-seeded for
+# local testing without Docker, see docs/docs/Getting Started + memory), but never its SQLite
+# write-ahead-log companions or run logs, which change on every run and aren't meaningful history.
+src/Executables/Single/data/*.db-shm
+src/Executables/Single/data/*.db-wal
+src/Executables/Single/*.log
+*.log
