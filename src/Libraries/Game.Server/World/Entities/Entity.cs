@@ -76,9 +76,20 @@ public abstract class Entity : IEntity
     public byte MovementSpeed { get; set; }
     public byte AttackSpeed { get; set; }
 
+    // See the long comment in Goto() - this is the assumed real-world speed (units/second) used to time
+    // movement when no real per-model animation data is available (currently: always, for every entity
+    // type - no *.msa files are shipped in this repo). Monsters want this conservative/slow (avoids
+    // landing hits before they've visually arrived); the player needs it as close to their true speed as
+    // possible (this position is both the view-circle center AND what gets persisted on disconnect).
+    protected virtual double FallbackMovementUnitsPerSecond => 250.0;
+
     public IReadOnlyCollection<IEntity> NearbyEntities => _nearbyEntities;
     private readonly List<IEntity> _nearbyEntities = new();
     public List<IPlayerEntity> TargetedBy { get; } = new();
+    // Was briefly dropped to 7500 - at the time, mobs seemed visible from further away than they should
+    // be, and the culprit turned out to be the real bug this whole investigation was chasing (the
+    // player's own position lagging behind their true position - see FallbackMovementUnitsPerSecond).
+    // Once that was fixed, 10000 (the real official value) was live-confirmed correct after all.
     public const int VIEW_DISTANCE = 10000;
 
     private int _positionX;
@@ -148,30 +159,50 @@ public abstract class Entity : IEntity
         MovementStart = startAt;
 
         var distance = MathUtils.Distance(StartPositionX, StartPositionY, TargetPositionX, TargetPositionY);
-        if (animation is null)
+
+        // Real per-model animation data (walk.msa/run.msa, driving `animationSpeed` below) isn't shipped in
+        // this repo's data set for every entity class (most monster races have no data/monster/<folder>
+        // motion files at all, AND player classes have none either - confirmed live, no *.msa file exists
+        // anywhere in this repo - never extracted from the real client packs, see AnimationManager). This
+        // used to fall back to MovementDuration = 0 whenever that lookup failed, which made Update() snap
+        // PositionX/Y straight to the destination on the very next tick regardless of real distance/elapsed
+        // time - i.e. the entity's SERVER-SIDE position teleported to its Goto() target instantly, while an
+        // observing client (which does have real motion assets) kept walking it there realistically over
+        // several more seconds. Since gameplay decisions (e.g. "is this monster within melee range yet?")
+        // read the server's position, this let monsters land real, server-validated hits from tens of
+        // meters away, well before they visually arrived on anyone's screen - reported as "mobs hit me from
+        // range / while still running towards me". Falling back to a conservative (slow) flat speed instead
+        // keeps movement taking a believable amount of time even without real per-model timing data.
+        //
+        // That same shared fallback, applied to the PLAYER's own movement, turned out to cause a SEPARATE,
+        // opposite bug: the server's dead-reckoned PositionX/Y (used as the center of the nearby-entity
+        // view circle, and what gets persisted on disconnect) fell further and further behind the client's
+        // true on-screen position over a long sustained run, since 250u/s underestimates real run speed -
+        // live-confirmed via reconnecting mid-run: the character always reappeared BEHIND where it visually
+        // was, exactly at the position the reveal/hide circle had actually been centered on the whole time.
+        // "Conservative/slow" is the right default for monsters (avoids the early-hit bug above) but wrong
+        // for the player's own movement (needs to track the true position as closely as possible) - split
+        // via FallbackMovementUnitsPerSecond so each entity type can pick what it actually needs.
+        var animationSpeed = animation is null
+            ? FallbackMovementUnitsPerSecond
+            : -animation.AccumulationY / animation.MotionDuration;
+
+        var i = 100 - MovementSpeed;
+        if (i > 0)
         {
-            MovementDuration = 0;
+            i = 100 + i;
+        }
+        else if (i < 0)
+        {
+            i = 10000 / (100 - i);
         }
         else
         {
-            var animationSpeed = -animation.AccumulationY / animation.MotionDuration;
-            var i = 100 - MovementSpeed;
-            if (i > 0)
-            {
-                i = 100 + i;
-            }
-            else if (i < 0)
-            {
-                i = 10000 / (100 - i);
-            }
-            else
-            {
-                i = 100;
-            }
-
-            var duration = (int)((distance / animationSpeed) * 1000) * i / 100;
-            MovementDuration = (uint)duration;
+            i = 100;
         }
+
+        var duration = (int)((distance / animationSpeed) * 1000) * i / 100;
+        MovementDuration = (uint)duration;
     }
 
     public virtual void Wait(int x, int y)
@@ -219,11 +250,15 @@ public abstract class Entity : IEntity
                 MeleeAttack(victim);
                 break;
             case EBattleType.RANGE:
-
-                RangeAttack(victim);
-                break;
             case EBattleType.MAGIC:
-                // todo magic attack
+                // The real server (char_battle.cpp CHARACTER::Attack) sends both of these through the
+                // same underlying Shoot() routine - a plain ranged shot for RANGE (Shoot(0)) vs. a magic
+                // bolt for MAGIC (Shoot(1)) - not two different damage formulas. RangeAttack here already
+                // factors in MAGIC_ATTACK_BONUS on top of ATTACK_BONUS, so it already covers both; this
+                // case used to be a bare `// todo magic attack` no-op, making every MAGIC-type monster
+                // (50 in this repo's mob_proto, e.g. White Oath General/Commander, Mi-Jung, Eun-Jung)
+                // completely harmless in melee/ranged combat.
+                RangeAttack(victim);
                 break;
         }
     }

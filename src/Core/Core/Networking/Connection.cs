@@ -160,60 +160,123 @@ public abstract class Connection : BackgroundService, IConnection
             return;
         }
 
+        // Was: dequeue exactly one packet, then await WriteAsync + FlushAsync + two plugin-hook round
+        // trips for THAT packet alone, before even looking at the next one. Fine for the steady trickle
+        // of single packets this loop normally sees, but a burst - initial map entry revealing everyone
+        // already in view, or a player crossing into a dense area - can queue 100+ packets (2 per
+        // revealed entity) within milliseconds. Live-measured via qcx_reveal_timing.log (server) vs
+        // qcx_create_profile.log (client): a 68-entity burst that the server revealed in 21ms took the
+        // client ~14 REAL seconds to finish receiving/creating, entirely explained by this loop sending
+        // those ~136 packets one full async round trip at a time - looking exactly like "monsters spawn
+        // in slowly" even though the server had already decided to reveal everyone at once. Fix: drain
+        // whatever's queued RIGHT NOW into one buffer and do a single WriteAsync+FlushAsync for the
+        // whole batch, instead of one pair per packet. Per-packet plugin hooks and debug logging are
+        // still run for every packet - only the actual socket I/O is coalesced.
+        var batch = new List<(object Packet, byte[] Bytes, int Size)>();
+
         while (_cts?.IsCancellationRequested != true)
         {
             try
             {
-                if (_packetsToSend.TryDequeue(out var obj))
+                if (_packetsToSend.IsEmpty)
                 {
-                    var packet = (IPacketSerializable) obj;
+                    await Task.Delay(1).ConfigureAwait(false); // wait at least 1ms
+                    continue;
+                }
+
+                batch.Clear();
+                var totalSize = 0;
+                // Cap how much we drain in one go so a pathologically large backlog doesn't demand one
+                // enormous contiguous buffer - the loop just comes straight back for the rest, no delay.
+                const int MAX_BATCH_PACKETS = 512;
+                while (batch.Count < MAX_BATCH_PACKETS && _packetsToSend.TryDequeue(out var queued))
+                {
+                    var packet = (IPacketSerializable) queued;
                     var size = packet.GetSize();
                     var bytes = ArrayPool<byte>.Shared.Rent(size);
                     Array.Clear(bytes, 0, size);
                     packet.Serialize(bytes);
-                    var bytesToSend = bytes.AsMemory(0, size);
+                    batch.Add((queued, bytes, size));
+                    totalSize += size;
+                }
+
+                // TEMP DIAGNOSTIC - "new mobs only appear closer and closer over time while standing
+                // still" investigation. If _packetsToSend is backing up faster than this loop can drain
+                // it, the remaining queue depth right after a drain should trend upward over the session
+                // - that would mean newly-decided reveals sit queued for longer and longer the longer the
+                // session runs, regardless of distance, which could look exactly like this.
+                if (batch.Count > 5)
+                {
+                    try
+                    {
+                        await System.IO.File.AppendAllTextAsync("C:\\qcx_send_queue.log",
+                                $"[{DateTime.UtcNow:HH:mm:ss.fff}] batch={batch.Count} totalSize={totalSize} remainingQueued={_packetsToSend.Count}\n")
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // best effort
+                    }
+                }
+
+                var buffer = ArrayPool<byte>.Shared.Rent(totalSize);
+                try
+                {
+                    if (_stream is null)
+                    {
+                        if (_cts is not null)
+                        {
+                            await _cts.CancelAsync();
+                        }
+
+                        _logger.LogCritical("Stream unexpectedly became null. This shouldn't happen");
+                        break;
+                    }
 
                     try
                     {
-                        if (_stream is null)
+                        var offset = 0;
+                        foreach (var (obj, bytes, size) in batch)
                         {
-                            if (_cts is not null)
-                            {
-                                await _cts.CancelAsync();
-                            }
-
-                            _logger.LogCritical("Stream unexpectedly became null. This shouldn't happen");
-                            break;
+                            await _pluginExecutor
+                                .ExecutePluginsAsync<IPacketOperationListener>(_logger,
+                                    x => x.OnPrePacketSentAsync(obj, CancellationToken.None))
+                                .ConfigureAwait(false);
+                            Buffer.BlockCopy(bytes, 0, buffer, offset, size);
+                            offset += size;
                         }
 
-                        await _pluginExecutor
-                            .ExecutePluginsAsync<IPacketOperationListener>(_logger,
-                                x => x.OnPrePacketSentAsync(obj, CancellationToken.None)).ConfigureAwait(false);
-                        await _stream.WriteAsync(bytesToSend).ConfigureAwait(false);
+                        await _stream.WriteAsync(buffer.AsMemory(0, totalSize)).ConfigureAwait(false);
                         await _stream.FlushAsync().ConfigureAwait(false);
-                        await _pluginExecutor.ExecutePluginsAsync<IPacketOperationListener>(_logger,
-                                x => x.OnPostPacketSentAsync(obj, bytes, CancellationToken.None))
-                            .ConfigureAwait(false);
+
+                        foreach (var (obj, bytes, size) in batch)
+                        {
+                            await _pluginExecutor.ExecutePluginsAsync<IPacketOperationListener>(_logger,
+                                    x => x.OnPostPacketSentAsync(obj, bytes, CancellationToken.None))
+                                .ConfigureAwait(false);
+
+                            if (_logger.IsEnabled(LogLevel.Debug))
+                            {
+                                _logger.LogDebug("OUT: {Type} => {Packet} (0x{Bytes})", obj.GetType(),
+#pragma warning disable VSTHRD103 // use async overload - doesn't work here
+                                    JsonSerializer.Serialize(obj),
+#pragma warning restore VSTHRD103
+                                    string.Join("", bytes.AsSpan(0, size).ToArray().Select(x => x.ToString("X2"))));
+                            }
+                        }
                     }
                     catch (Exception e)
                     {
-                        _logger.LogError(e, "Failed to send packet");
+                        _logger.LogError(e, "Failed to send packet batch ({Count} packets)", batch.Count);
                     }
-
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                    {
-                        _logger.LogDebug("OUT: {Type} => {Packet} (0x{Bytes})", packet.GetType(),
-#pragma warning disable VSTHRD103 // use async overload - doesn't work here
-                            JsonSerializer.Serialize(obj),
-#pragma warning restore VSTHRD103
-                            string.Join("", bytesToSend.ToArray().Select(x => x.ToString("X2"))));
-                    }
-
-                    ArrayPool<byte>.Shared.Return(bytes);
                 }
-                else
+                finally
                 {
-                    await Task.Delay(1).ConfigureAwait(false); // wait at least 1ms
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    foreach (var (_, bytes, _) in batch)
+                    {
+                        ArrayPool<byte>.Shared.Return(bytes);
+                    }
                 }
             }
             catch (SocketException)

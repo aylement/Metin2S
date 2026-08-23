@@ -30,6 +30,16 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
 {
     public override EEntityType Type => EEntityType.PLAYER;
 
+    // See Entity.FallbackMovementUnitsPerSecond and the long comment in Entity.Goto(): monsters keep the
+    // conservative 250 default, but a player's OWN tracked position needs to track their true real-time
+    // speed as closely as possible - it's both the center of their view circle and what gets persisted on
+    // disconnect. 250 was live-confirmed too slow (reconnecting after a long run always landed BEHIND
+    // where the player visually was). 400 is a first empirical estimate, not measured against the real
+    // client's actual run speed constant (no source for that in this repo) - retune based on live
+    // feedback: if reconnect-after-a-long-run still lands behind, raise it further; if it now overshoots
+    // ahead of where the player actually was, lower it.
+    protected override double FallbackMovementUnitsPerSecond => 1200.0;
+
     public string Name => Player.Name;
     public IGameConnection Connection { get; }
     public PlayerData Player { get; private set; }
@@ -1160,15 +1170,59 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
         await playerManager.SetPlayerAsync(Player);
     }
 
+    // A closest-first-sorted "pending reveals" queue used to live here, added to spread out the burst of
+    // ShowEntity calls from walking through a dense area (this repo's maps can have 1000+ monsters,
+    // matching real official server density - not itself a bug). It caused a real, worse bug of its own:
+    // sorting by CURRENT distance every flush meant a continuously-moving player kept having freshly
+    // nearby (and so momentarily "closest") entities cut in front of older ones discovered earlier in the
+    // walk - those older entries could be starved indefinitely as long as movement kept surfacing new,
+    // closer candidates, only draining once the player actually stopped. Live-reported as "monsters spawn
+    // in front of me, then I outrun them, then once I stop everything catches up from the direction I
+    // came" - an exact match for FIFO-violating starvation, not a pacing/burst problem at all. Removed
+    // entirely: the real fix for the client's rendering burst turned out to belong client-side (a
+    // wall-clock-paced creation budget in NetworkActorManager.cpp's __OLD_Update(), confirmed live -
+    // CInstanceBase::Create() itself only averages ~2ms, so no server-side throttling is needed once the
+    // client paces its own instantiation correctly). Back to the simple, immediate, starvation-free
+    // behaviour: reveal/hide exactly when Map.cs's nearby-scan says so, no queue in between.
     protected override void OnNewNearbyEntity(IEntity entity)
     {
         ArgumentNullException.ThrowIfNull(entity);
+        // TEMP DIAGNOSTIC - "new mobs only appear closer and closer over time" investigation: added
+        // dist= (true distance from the player at reveal time) to directly check whether new reveals
+        // trend toward shorter distances over the course of a session, instead of guessing from vids.
+        try
+        {
+            var dist = (int)Math.Sqrt(Math.Pow(entity.PositionX - PositionX, 2) +
+                                       Math.Pow(entity.PositionY - PositionY, 2));
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "qcx_reveal_timing.log"),
+                $"[{DateTime.UtcNow:HH:mm:ss.fff}] player={Vid} pos=({PositionX},{PositionY}) reveal vid={entity.Vid} type={entity.Type} dist={dist}\n");
+        }
+        catch
+        {
+            // best effort
+        }
+
         entity.ShowEntity(Connection);
     }
 
     protected override void OnRemoveNearbyEntity(IEntity entity)
     {
         ArgumentNullException.ThrowIfNull(entity);
+        // TEMP DIAGNOSTIC - matches the reveal-timing log, but for the remove/hide side, which was
+        // never actually measured before - "mobs from way behind me still visible" could be either the
+        // server never deciding to remove them, or deciding to but the client not acting on it.
+        try
+        {
+            var dist = (int)Math.Sqrt(Math.Pow(entity.PositionX - PositionX, 2) +
+                                       Math.Pow(entity.PositionY - PositionY, 2));
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "qcx_reveal_timing.log"),
+                $"[{DateTime.UtcNow:HH:mm:ss.fff}] player={Vid} pos=({PositionX},{PositionY}) HIDE vid={entity.Vid} type={entity.Type} dist={dist}\n");
+        }
+        catch
+        {
+            // best effort
+        }
+
         entity.HideEntity(Connection);
     }
 
