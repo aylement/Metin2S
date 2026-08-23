@@ -43,6 +43,17 @@ public class Map : IMap
 
     private readonly List<IEntity> _nearby = new();
     private readonly List<IEntity> _remove = new();
+
+    // Time-based nearby-rescan throttle (replaces an earlier sector-crossing-based version - see the
+    // Update() loop below for the full reasoning/history). User spec, live-confirmed as the actual
+    // desired behaviour: every mob within the exact VIEW_DISTANCE circle around the player should be
+    // visible, refreshing at most every 1-2 real seconds as the player moves - both revealing what's
+    // newly in range AND removing what's fallen out of range on the trailing side, symmetrically and
+    // continuously (not a periodic "wave" tied to a coarse grid, which a sector crossing every ~6400
+    // units could delay by up to ~1 minute across a wide dense zone at normal walking speed).
+    private static readonly TimeSpan NEARBY_RESCAN_INTERVAL = TimeSpan.FromSeconds(1);
+    private readonly Dictionary<IEntity, ServerTimestamp> _lastNearbyScanTime = new();
+
     private readonly ConcurrentQueue<IEntity> _pendingRemovals = new();
     private readonly ConcurrentQueue<IEntity> _pendingSpawns = new();
     private readonly IMonsterManager _monsterManager;
@@ -143,6 +154,10 @@ public class Map : IMap
                 e.AddNearbyEntity(entity);
             }
 
+            // Record that this initial scan already happened just now, so the regular per-tick loop
+            // below doesn't immediately redo a rescan this same tick.
+            _lastNearbyScanTime[entity] = ctx.Timestamp;
+
             _entities.Add(entity);
             entity.Map = this;
         }
@@ -168,6 +183,10 @@ public class Map : IMap
             // Remove entity from the quad tree
             _quadTree.Remove(entity);
 
+            // Drop its rescan-timing bookkeeping too, otherwise this dictionary leaks one entry per
+            // monster death/respawn cycle forever.
+            _lastNearbyScanTime.Remove(entity);
+
             if (entity is IDisposable dis)
             {
                 try
@@ -187,62 +206,108 @@ public class Map : IMap
         {
             entity.Update(ctx);
 
-            if (entity.PositionChanged)
+            var justMoved = entity.PositionChanged;
+            if (justMoved)
             {
                 entity.PositionChanged = false;
 
                 // Update position in our quad tree (used for faster nearby look up)
                 _quadTree.UpdatePosition(entity);
-
-                if (entity.Type == EEntityType.PLAYER)
-                {
-                    // Check which entities are relevant for nearby
-                    EEntityType? filter = null;
-                    if (entity.Type != EEntityType.PLAYER)
-                    {
-                        // if we aren't a player only players are relevant for nearby
-                        filter = EEntityType.PLAYER;
-                    }
-
-                    // Update entities nearby
-                    _quadTree.QueryAround(_nearby, entity.PositionX, entity.PositionY, Entity.VIEW_DISTANCE,
-                        filter);
-
-                    // Check nearby entities and mark all entities which are too far away now
-                    foreach (var e in entity.NearbyEntities)
-                    {
-                        // Remove this entity from our temporary list as they are already in it
-                        if (!_nearby.Remove(e))
-                        {
-                            // If it wasn't in our temporary list it is no longer in view
-                            _remove.Add(e);
-                        }
-                    }
-
-                    // Remove previously marked entities on both sides
-                    foreach (var e in _remove)
-                    {
-                        e.RemoveNearbyEntity(entity);
-                        entity.RemoveNearbyEntity(e);
-                    }
-
-                    // Add new nearby entities on both sides
-                    foreach (var e in _nearby)
-                    {
-                        if (e == entity)
-                        {
-                            continue; // do not add ourself!
-                        }
-
-                        e.AddNearbyEntity(entity);
-                        entity.AddNearbyEntity(e);
-                    }
-
-                    // Clear our temporary lists
-                    _nearby.Clear();
-                    _remove.Clear();
-                }
             }
+
+            // Bug found live-testing this exact build: gating the ENTIRE rescan behind "did I just
+            // move" meant a player who STOPPED moving never rescanned again - full stop. A monster that
+            // wandered out of true view range near where the player started stayed visible until, by
+            // chance, THAT monster's own movement-triggered rescan happened to notice the player was now
+            // too far (i.e. only fixed opportunistically whenever some other entity happened to move) -
+            // matching exactly what got reported: "eventually disappears, but can take 10+ seconds"
+            // after stopping, with no reliable bound. A stationary player still needs their OWN nearby
+            // list refreshed periodically, because the entities AROUND them keep moving even when they
+            // don't. Non-player entities don't need this same treatment - if a stationary monster's set
+            // of nearby players goes stale, the affected player's own periodic sweep (below) corrects it
+            // from their side, so skipping monsters here is a real perf win, not a correctness gap.
+            var isPlayer = entity.Type == EEntityType.PLAYER;
+            if (!justMoved && !isPlayer)
+            {
+                continue;
+            }
+
+            // History of this rescan gate, in order:
+                // 1) rescan on every real position change, unconditionally - correct (live-confirmed
+                //    <100ms server-reveal to client-create latency, nothing genuinely missing), but user
+                //    live-testing this build still called it "the same" as before.
+                // 2) a naive "only rescan every N units moved" throttle (NEARBY_RESCAN_DISTANCE=500) -
+                //    tried and REMOVED. Reduced rescan frequency without widening the query radius to
+                //    match, so entities that entered true view range between two rescans genuinely
+                //    weren't revealed until the next one - a real, measured 20-30 rescans/~25-35s delay.
+                // 3) sector-crossing batching (SECTOR_SIZE=6400, matching the real game's sectree grid) -
+                //    tried and REMOVED. User live-tested and clarified the actual desired spec: a plain,
+                //    frequent (1-2s) refresh of the exact VIEW_DISTANCE circle around the live position -
+                //    entities should appear/disappear continuously as the circle follows the player (e.g.
+                //    mobs to the south leaving view as you walk north, mobs to the north entering it), not
+                //    in occasional large "waves" gated on crossing a coarse fixed grid - a wide dense zone
+                //    could still take close to a MINUTE to fully populate that way at ~15s/sector.
+                // 4) time-based throttle (this version): rescan any single entity at most once per
+                //    NEARBY_RESCAN_INTERVAL, but always with the exact VIEW_DISTANCE radius against its
+                //    CURRENT live position - no margin needed, since each rescan is a fresh ground-truth
+                //    query rather than an extrapolation from a stale reference point. This bounds the
+                //    worst-case reveal/hide delay to exactly NEARBY_RESCAN_INTERVAL, both directions.
+                // Recompute nearby entities whenever ANYTHING moves, not just players (unchanged from the
+                // original fix - see git history/[[mob-visibility-delay-investigation]] for why).
+                ServerTimestamp? lastScan =
+                    _lastNearbyScanTime.TryGetValue(entity, out var t) ? t : null;
+                if (ctx.ElapsedSince(lastScan) < NEARBY_RESCAN_INTERVAL)
+                {
+                    // Rescanned this entity recently enough already - nothing to do yet.
+                    continue;
+                }
+
+                _lastNearbyScanTime[entity] = ctx.Timestamp;
+
+                EEntityType? filter = null;
+                if (entity.Type != EEntityType.PLAYER)
+                {
+                    // if we aren't a player only players are relevant for nearby
+                    filter = EEntityType.PLAYER;
+                }
+
+                // Update entities nearby
+                _quadTree.QueryAround(_nearby, entity.PositionX, entity.PositionY, Entity.VIEW_DISTANCE,
+                    filter);
+
+                // Check nearby entities and mark all entities which are too far away now
+                foreach (var e in entity.NearbyEntities)
+                {
+                    // Remove this entity from our temporary list as they are already in it
+                    if (!_nearby.Remove(e))
+                    {
+                        // If it wasn't in our temporary list it is no longer in view
+                        _remove.Add(e);
+                    }
+                }
+
+                // Remove previously marked entities on both sides
+                foreach (var e in _remove)
+                {
+                    e.RemoveNearbyEntity(entity);
+                    entity.RemoveNearbyEntity(e);
+                }
+
+                // Add new nearby entities on both sides
+                foreach (var e in _nearby)
+                {
+                    if (e == entity)
+                    {
+                        continue; // do not add ourself!
+                    }
+
+                    e.AddNearbyEntity(entity);
+                    entity.AddNearbyEntity(e);
+                }
+
+            // Clear our temporary lists
+            _nearby.Clear();
+            _remove.Clear();
         }
     }
 
