@@ -32,7 +32,9 @@ public class CharacterMoveHandler : IGamePacketHandler<CharacterMove>
 
         if (ctx.Connection.Player is null)
         {
-            _logger.LogCritical("Cannot move player that does not exist. This is a programmatic failure");
+            _logger.LogCritical(
+                "Cannot move player that does not exist. This is a programmatic failure ({ConnectionId})",
+                ctx.Connection.Id);
             ctx.Connection.Close();
             return Task.CompletedTask;
         }

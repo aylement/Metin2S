@@ -29,6 +29,24 @@ public abstract class Connection : BackgroundService, IConnection
     private ServerTimestamp _lastHandshakeTime;
     private CancellationTokenSource? _cts;
 
+    // Guards Close() against running twice for the same connection - see the comment on Close() itself
+    // for why this was a real, live-hit bug, not just theoretical hardening.
+    private int _closed;
+
+    // Set by MarkExpectedClose() when THIS server deliberately tells the client to disconnect and
+    // reconnect (currently only PlayerEntity.Warp()'s cross/same-map warp packet). ExecuteAsync's read
+    // loop below sees the resulting socket close purely as "the stream ended" - it has no way to tell a
+    // deliberate server-initiated disconnect apart from the player just closing the game, so it always
+    // called Close(false) ("unexpected"), which makes GameConnection.OnCloseAsync take its heavy path
+    // (CalculatePlayedTimeAsync + a full second PersistAsync). Warp() already does its OWN explicit
+    // blocking persist right before sending the warp packet - a warp-triggered reconnect running that
+    // heavy path AGAIN a moment later, on a connection that's mid-teardown, was live-confirmed as a real
+    // (if intermittent) cause of "Cannot access a disposed context instance" and the client sometimes
+    // needing a second manual reconnect after breaking a Devil Tower floor trigger.
+    private volatile bool _expectedClose;
+
+    public void MarkExpectedClose() => _expectedClose = true;
+
     public IPAddress BoundIpAddress { get; private set; } = IPAddress.Any;
 
     public Guid Id { get; }
@@ -69,7 +87,8 @@ public abstract class Connection : BackgroundService, IConnection
             return;
         }
 
-        _logger.LogInformation("New connection from {RemoteEndPoint}", _client.Client.RemoteEndPoint?.ToString());
+        _logger.LogInformation("New connection {ConnectionId} from {RemoteEndPoint}", Id,
+            _client.Client.RemoteEndPoint?.ToString());
 
         _stream = _client.GetStream();
         StartHandshake();
@@ -91,24 +110,35 @@ public abstract class Connection : BackgroundService, IConnection
         catch (IOException e)
         {
             _logger.LogDebug(e, "Connection was closed. Probably by the other party");
-            Close(false);
+            Close(_expectedClose);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             // Normal shutdown, don't log as error
-            Close(false);
+            Close(_expectedClose);
         }
         catch (Exception e)
         {
             _logger.LogError(e, "Failed to read from stream");
-            Close(false);
+            Close(_expectedClose);
         }
 
-        Close(false);
+        Close(_expectedClose);
     }
 
     public void Close(bool expected = true)
     {
+        // ExecuteAsync's read loop below calls Close(false) from inside a catch block AND unconditionally
+        // right after the try/catch (no `return` after the catch's own call) - meaning a normal disconnect
+        // (any read exception, which is the ordinary way a closed socket surfaces) ran this method's full
+        // body TWICE for the same connection. The second pass re-entered GameConnection.OnCloseAsync with
+        // the same still-non-null Player and re-ran the full despawn/persist chain on an entity (and DB
+        // scope) the first pass had already torn down - live-confirmed as the real cause of a Warp-
+        // triggered reconnect sometimes dying with "Cannot access a disposed context instance"
+        // (SqliteGameDbContext) and the new connection's first packet then failing with "Cannot move
+        // player that does not exist". Idempotent guard instead of hunting down/fixing every call site.
+        if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+
         _cts?.Cancel();
         _client?.Close();
 
@@ -334,7 +364,7 @@ public abstract class Connection : BackgroundService, IConnection
         if (difference >= TimeSpan.Zero && difference <= TimeSpan.FromMilliseconds(50))
         {
             // if we difference is less than or equal to 50ms the handshake is done and client time is synced enough
-            _logger.LogInformation("Handshake done");
+            _logger.LogInformation("Handshake done {ConnectionId}", Id);
             Handshaking = false;
 
             OnHandshakeFinished();

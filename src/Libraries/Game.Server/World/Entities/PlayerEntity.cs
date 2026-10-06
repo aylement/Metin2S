@@ -312,21 +312,40 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
 
     private void Warp(Coordinates position) => Warp((int)position.X, (int)position.Y);
 
+    /// <summary>
+    /// Forces a hard warp (disconnect + client-driven reconnect at the target position) even when the
+    /// target is on the SAME map - unlike <see cref="Move(Coordinates)"/>, which only warps when the
+    /// destination is outside the current map's bounds and otherwise just walks there. Needed for
+    /// same-map "instant relocation" content like the Devil Tower's floor transitions (all floors live
+    /// inside one single map file, distinguished only by Y-position bands - see
+    /// docs/docs/Guides/monster-visibility-tuning.md's sibling devil-tower notes), where a slow walk
+    /// across the whole map is not the intended effect.
+    /// </summary>
+    public void WarpTo(Coordinates position) => Warp(position);
+
     private void Warp(int x, int y)
     {
         PositionX = x;
         PositionY = y;
 
         // Persist the new position before anything else below: the Warp packet sent at the end of this
-        // method tells the CLIENT to disconnect and reconnect at the target server/port - that reconnect
-        // is a deliberate, client-initiated close, so GameConnection.OnCloseAsync sees `expected: true`
-        // and takes the same non-persisting World.DespawnEntity path we call a few lines down (only an
-        // *unexpected* disconnect goes through World.DespawnPlayerAsync -> OnDespawnAsync -> PersistAsync).
-        // Without this explicit call, a warp across map boundaries (e.g. GotoCommand's `/goto -m <map>`
-        // jumping somewhere outside the current map's bounds) never reaches the database, so the
-        // reconnecting client re-enters at the last position that WAS persisted (typically wherever the
-        // player last logged in) instead of where they just warped to - confirmed live: `/goto -m
-        // n_flame_01` "reloaded" the client right back onto metin2_map_c1.
+        // method tells the CLIENT to disconnect and reconnect at the target server/port. Without this
+        // explicit call, a warp across map boundaries (e.g. GotoCommand's `/goto -m <map>` jumping
+        // somewhere outside the current map's bounds) never reaches the database, so the reconnecting
+        // client re-enters at the last position that WAS persisted (typically wherever the player last
+        // logged in) instead of where they just warped to - confirmed live: `/goto -m n_flame_01`
+        // "reloaded" the client right back onto metin2_map_c1.
+        //
+        // This comment used to claim the resulting client-initiated close already reached
+        // GameConnection.OnCloseAsync as `expected: true`, taking the lightweight non-persisting
+        // World.DespawnEntity path - that was never actually true: Connection.ExecuteAsync's read loop
+        // has no way to tell "the client is reconnecting because we told it to" apart from any other
+        // socket closure, so it always called Close(false), redundantly re-running the FULL
+        // unexpected-disconnect persist path (World.DespawnPlayerAsync) a moment after this method's own
+        // explicit persist above - on a connection that's mid-teardown, sometimes racing its own DI scope
+        // being disposed ("Cannot access a disposed context instance"), live-confirmed as a real,
+        // intermittent cause of a warp-triggered reconnect needing a second manual reconnect. Fixed by
+        // actually telling the connection this close is expected, via MarkExpectedClose() below.
         //
         // Deliberately BLOCKING here (.GetAwaiter().GetResult(), not the fire-and-forget `_ =` this started
         // as) rather than making Warp/Move async and rippling that through every IEntity.Move caller: a
@@ -336,15 +355,21 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
         // write can clobber the newer one. Confirmed live: reconnecting landed on a position from BEFORE
         // the last /goto, not the actual last position. A cross-map warp is rare/one-off, not a hot path,
         // so a brief block here is an acceptable trade for guaranteed write ordering.
+        // TEMP diagnostic (tracking down a hang seen live where a Devil Tower floor clear's Warp() call
+        // was entered but "Warp!" below never got logged - remove once confirmed this blocking persist
+        // isn't the cause, e.g. thread-pool starvation under a heavy combat burst).
+        _logger.LogInformation("Warp() entered for connection {ConnectionId}, persisting before warp...",
+            Connection.Id);
 #pragma warning disable VSTHRD002 // use await - TODO, same pattern as World.cs's SpawnEntity/DespawnEntity
         PersistAsync().GetAwaiter().GetResult();
 #pragma warning restore VSTHRD002
+        _logger.LogInformation("Warp() persist done for connection {ConnectionId}", Connection.Id);
 
         _world.DespawnEntity(this);
 
         var host = _world.GetMapHost(PositionX, PositionY);
 
-        _logger.LogInformation("Warp!");
+        _logger.LogInformation("Warp! (old connection {ConnectionId})", Connection.Id);
         var packet = new Warp
         {
             PositionX = PositionX,
@@ -352,6 +377,7 @@ public class PlayerEntity : Entity, IPlayerEntity, IDisposable
             ServerAddress = BitConverter.ToInt32(host.Ip.GetAddressBytes()),
             ServerPort = host.Port
         };
+        Connection.MarkExpectedClose();
         Connection.Send(packet);
     }
 

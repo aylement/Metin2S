@@ -16,8 +16,8 @@ public class ClientVersionPacketHandler : IGamePacketHandler<Version>
 
     public Task ExecuteAsync(GamePacketContext<Version> ctx, CancellationToken token = default)
     {
-        _logger.LogInformation("Received client version: {Name} {Timestamp}", ctx.Packet.ExecutableName,
-            ctx.Packet.Timestamp);
+        _logger.LogInformation("Received client version {ConnectionId}: {Name} {Timestamp}", ctx.Connection.Id,
+            ctx.Packet.ExecutableName, ctx.Packet.Timestamp);
 
         return Task.CompletedTask;
     }

@@ -40,6 +40,11 @@ public class NullGameConnection : IGameConnection
         IsClosed = true;
     }
 
+    public void MarkExpectedClose()
+    {
+        // No real socket/read-loop backs this connection to consult this flag - a no-op is correct.
+    }
+
     public void Send<T>(T packet) where T : IPacketSerializable
     {
         // Bots have no client to send packets to - discard silently
