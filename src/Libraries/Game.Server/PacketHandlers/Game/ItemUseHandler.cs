@@ -1,25 +1,33 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using QuantumCore.API;
+using QuantumCore.API.Core.Models;
 using QuantumCore.API.Extensions;
 using QuantumCore.API.Game.Types.Items;
 using QuantumCore.API.Game.Types.Skills;
+using QuantumCore.API.Game.World;
 using QuantumCore.API.Packets;
 using QuantumCore.API.PluginTypes;
 using QuantumCore.Core.Utils;
 using QuantumCore.Game.Extensions;
+using QuantumCore.Game.Items;
 
 namespace QuantumCore.Game.PacketHandlers.Game;
 
 internal class ItemUseHandler : IGamePacketHandler<ItemUse>
 {
     private readonly IItemManager _itemManager;
+    private readonly IItemRepository _itemRepository;
+    private readonly ICacheManager _cacheManager;
     private readonly ILogger<ItemUseHandler> _logger;
     private readonly SkillsOptions _skillsOptions;
 
-    public ItemUseHandler(IItemManager itemManager, ILogger<ItemUseHandler> logger, IOptions<GameOptions> gameOptions)
+    public ItemUseHandler(IItemManager itemManager, IItemRepository itemRepository, ICacheManager cacheManager,
+        ILogger<ItemUseHandler> logger, IOptions<GameOptions> gameOptions)
     {
         _itemManager = itemManager;
+        _itemRepository = itemRepository;
+        _cacheManager = cacheManager;
         _logger = logger;
         _skillsOptions = gameOptions.Value.Skills;
     }
@@ -129,6 +137,45 @@ internal class ItemUseHandler : IGamePacketHandler<ItemUse>
         {
             player.RemoveItem(item);
             player.SendRemoveItem(ctx.Packet.Window, ctx.Packet.Position);
+        }
+        // Single-use "open for a random reward" boxes (e.g. Esoteric Leader's Box) - see BoxDefinitions.
+        else if (BoxDefinitions.Boxes.TryGetValue(itemProto.Id, out var rewards))
+        {
+            var reward = rewards[CoreRandom.GenerateInt32(0, rewards.Length)];
+            var description = await reward.GrantAsync(player, _itemManager, _itemRepository);
+
+            if (description is null)
+            {
+                // Only ItemBoxReward can fail this way (no free inventory slot) - leave the box
+                // unconsumed so the player can free up space and try again, same as every other
+                // "couldn't fit it" case in this handler.
+                player.SendChatInfo("Not enough inventory space to open this box");
+                return;
+            }
+
+            await ConsumeOneAsync(player, item, ctx.Packet.Window, ctx.Packet.Position);
+            player.SendChatInfo($"{itemProto.TranslatedName}: you received {description}");
+        }
+    }
+
+    /// <summary>
+    /// Removes exactly one unit of a (possibly stacked) item - decrementing the stack if more than one
+    /// remains, or fully removing it otherwise. Mirrors PlayerEntity.DropItemAsync's own count==count vs
+    /// count-=count split, which isn't exposed as a standalone helper there.
+    /// </summary>
+    private async Task ConsumeOneAsync(IPlayerEntity player, ItemInstance item, WindowType window, ushort position)
+    {
+        if (item.Count <= 1)
+        {
+            player.RemoveItem(item);
+            player.SendRemoveItem(window, position);
+            await _itemRepository.DeletePlayerItemAsync(_cacheManager, item.PlayerId, item.ItemId);
+        }
+        else
+        {
+            item.Count -= 1;
+            await item.PersistAsync(_itemRepository);
+            player.SendItem(item);
         }
     }
 }

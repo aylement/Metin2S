@@ -8,6 +8,7 @@ public interface IItemManager
     ItemData? GetItem(uint id);
     bool TryGetItem(uint id, [NotNullWhen(true)] out ItemData? itemData);
     ItemData? GetItemByName(ReadOnlySpan<char> name);
+    IEnumerable<ItemData> GetItems();
     Task LoadAsync(CancellationToken token = default);
     ItemInstance CreateItem(ItemData proto, byte count = 1);
 }

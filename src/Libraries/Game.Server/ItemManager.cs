@@ -46,6 +46,8 @@ internal sealed class ItemManager : IItemManager, ILoadable
         return data is not null;
     }
 
+    public IEnumerable<ItemData> GetItems() => _items;
+
     public ItemData? GetItemByName(ReadOnlySpan<char> name)
     {
         foreach (var dataItem in _items)
@@ -109,6 +111,12 @@ internal sealed class ItemManager : IItemManager, ILoadable
             WearFlags = proto.WearFlags,
             MagicItemPercentage = proto.MagicItemPercentage
         }).ToImmutableArray();
+
+        // TEMP: one-off dump for looking up real item_proto ids while building the Esoteric Leader's
+        // Box loot table - read directly from disk instead of needing a connected client to run
+        // `finditem` per name. Safe/cheap to leave in; remove once the box feature is done.
+        await File.WriteAllLinesAsync("item_dump.txt",
+            _items.Select(i => $"{i.Id}\t{i.Name}\t{i.TranslatedName}"), token);
     }
 
     /// <summary>
