@@ -1,0 +1,5 @@
+//type	cx	cy	sx	sy	z	dir	time	percent	count	vnum
+//-----------------------------------------------------------------------------------
+// "Demon Tower Guard" - City Guard skin (vnum 11000), right-click warps to the tower's floor 1. The
+// actual warp behavior is registered in World.cs's RegisterDevilTowerGuard(), scoped to this map+vnum.
+m	528	593	0	0	0	0	5s	100	1	11000

@@ -89,8 +89,10 @@ public abstract class Entity : IEntity
     // Was briefly dropped to 7500 - at the time, mobs seemed visible from further away than they should
     // be, and the culprit turned out to be the real bug this whole investigation was chasing (the
     // player's own position lagging behind their true position - see FallbackMovementUnitsPerSecond).
-    // Once that was fixed, 10000 (the real official value) was live-confirmed correct after all.
-    public const int VIEW_DISTANCE = 10000;
+    // 10000 (the real official value) was live-confirmed correct after that fix. Bumped again to 15000
+    // per user preference while building/testing the Devil Tower content (wanted more visibility inside
+    // the tower) - no longer strictly "the real official value", a deliberate live tuning choice.
+    public const int VIEW_DISTANCE = 15000;
 
     private int _positionX;
     private int _positionY;

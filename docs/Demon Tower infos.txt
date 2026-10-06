@@ -1,0 +1,54 @@
+1. Stats that work very well in this run
+Strong against Undead
+Arrow Resist
+Magic Resist
+Block physical attack
+HP Restore
+Average Damage Resist for the Monster hoards
+Skill Resist for the Bosses
+High Level Polymorph Skill
+The higher you get, the less relevant Arrow and the more relevant Magic resist will become, starting on the 10th floor you will barely find any archers but a lot of Monsters that deal a big chunk of Magic Damage. Some of them also deal a bit of Skill damage but overall i'd say you are better off with AVG Dmg Resist or HP Restore Items.
+
+If you want to actively Level up in the 11th Floor, make sure to have as much Undead, Magic Res and Block Physical Attack as possible, max HP restore will help you a big deal, if you manage to kill the monsters fast enough you wont have time to die.
+
+
+
+
+
+2. Items you should bring
+
+A Bracelet with 8% HP Restore, best case scenario would be Ebony or Heaven's Tear.
+A spare armour, shield and shoes with Skill Resist for the Blue Death
+Instant HP potions which can be crafted at the NPC's Baek-Go, David and Yu-Hwan
+If you want to Level up here, Quillin Shoes will help a great deal
+Green Liquid and White Liquid for extra AC and Magic resist will also help a lot in the case of leveling in 11th floor
+Polymorph Marbles
+
+3. The Floors
+1. To start the run, simply destroy the Level 50 Metin which waits at the back side of the room.
+2. This Floor consists of a bunch of Monsters, kill them all to proceed
+3. This Floor has your first Boss, the Demon King. Killing him will grant you a skill book and a chance for a Soul Stone. Also, he will send you forward into the next floor after being killed. We Removed all extra mobs on this floor.
+4. Destroy the Level 55 Metin to start the Floor, after you broke it, eight Level 60 Metins will spawn. 7 of these Metins are fake, find the correct one and break it in order to proceed
+5. This Floor has a total of 5 Seals which have to be broken. We drastically reduced the respawn timer on all Monsters in this Floor in order to make it more enjoyable. Kill the Monsters untill you gained 5 Unlock Stones which you will then have to drag onto the Pillars in order to break the Seal and proceed to the 6th Floor.
+6. This Floor will match you against your second Boss, the Proud Demon King. This Boss monster not only guards a Boss Chest but also 3 of the 4 Blacksmiths. Your Goal is to kill him, we removed all extra Monsters on this floor. After you killed him, one of three blacksmiths will randomly spawn; Armor, Weapon or Acc. Designer these blacksmith will allow you to upgrade one Item of your choice without the need of any Upgrade materials. Its upgrade chance is the same as any other standard upgrading variation (Blacksmith, Blessing Scroll) After you finished upgrading, talk to him to Proceed to the 7th Floor. Important Note: In order to Proceed, Level 75 is required.
+7. The first half is done and you defeated the basic Bosses of the Runs, now that you reached the 7th Floor your goal is to destroy four Level 65 Metins. After you successfully broke them, a lot of Monsters and a single Level 70 Metin will spawn, destroy the Level 70 Metin in order to obtain the "Unknown Old Chest", this Item will give you the "Elite Demon Tower Map" which will allow you to proceed to the 8th Floor. It will always drop the correct Map, the fakes were removed. Right click it in order to proceed.
+8. After you used the Map you will now need to find the "Elite Demon Key", it drops from the Immortal Ghosts. Drag it onto the big gravestone in the back of the Room in order to proceed.
+9. You finally made it to the first Major Boss Room. Your goal here is to kill the Death Reaper. Killing it will potentially grant you 1-2 "Death Reaper`s Chests" with increased chance for Rarity Items, a "Cor Draconis (Rare)" and a "Dark Lord's Fang". Using a Polymorph marble will make this fight a lot easier.
+10. You did it! You killed the Death Reaper! Oh wait.. theres more. Yet again the Demon King is mad about you killing him and respawned, this time his name is "Vile Elite Demon King" it is impossible to kill him without the "Enchant Damage" Buff of a Dragon Mage. Your only goal is to kill this Boss, you do not need to kill all the Monsters around him. If you deal a good amount of Damage you can just rush him, sitting on your horse and kill him before the Monsters can even attack you. He can drop you a "Treasure Chest"
+11. After killing the most persistent Monster in the game, which came back twice in order to stop your journey, you have now reached the 11th Floor. Your goal here is to Break another 5 Seals, this time killing monsters wont grant you the Unlock Stones however. A total of five "Metin Stones of Eternal Death" spawn inside of this Floor which will drop you the "Seal of Eternal Death". The easiest Strategy is to simply pull all the Monsters to one side of the Room and Destroy the Metins on the other side of the Room since they will otherwise inflict heavy amounts of Damage. Don't let the fact that there's only 5 Seals to break fool you, the Unlock Stones might fail t o unlock them. Farm atleast 15-20ish if you want to be safe, you might even want to farm more if you feel unlucky. Unlocking the seals might get you close to the Monsters you dragged away earlier and thus will make it harder to go back to breaking the Metins in case you didn't manage to unlock all the seals. After breaking all the Seals you will proceed to the 12th Floor. Important Note: If you want to use the Demon Tower in order to Level up, this is your floor of choice. Both, the Monsters and Metins respawn infinitely and grant a good amount of EXP. The Metins are the easier choice, if you are able to tank a few groups of the Monsters however, the EXP might be more rewarding.
+12. You have reached the final Floor! It is time for your showdown with the Blue Death, which protects the very special "Rarity Smith". Killing the Blue Death will potentially grant you 1-2 "Blue Death's Chest", a "Cor Draconis (Antique)" and another "Dark Lord's Fang", aswell as access to the Rarity Smith. Important Notes: It is impossible to kill the Blue Death without the use of a Polymorph Marble. Danger! This Boss deals massive amounts of damage, make sure you have a lot of Skill Resist, HP and Instant HP Potions!
+
+4. Important Drops in this Area
+Demon's Keepsake, Demon's Keepsake+,Demon's Gem, Demon's Gem+ - While they are Upgrade Items, most of them also have another purpose. 8 "Demon's Gem+" and 8 "Demon's Keepsake+" can be combined at Baek-Go in order to gain a "Demon Spearman Poly Marble". "Demon's Keepsake" is also used for the Level 50 Biologist Quest.
+Finger Bones - Those Items are dropped from the 2nd floor onwards, they are the main upgrade material for Level 60 Helmets +7 - +9
+Dark Lord's Fang, Dark Lord's Nail - These Items are dropped by the Blue Death and Death Reaper exclusively and used in the Refine+ System as extra upgrade Items
+Level 66 Armors, Level 75 Weapons, Level 70 Weapons - The Blue Death and Death Reaper Chests are a very good place to farm these Items, since they grant increased chance for Rarity.
+Heaven's Tear Bracelet a Level 40 Character can farm quite a few of these bracelets on the ground floor of the Dungeon, while also farming the typical Keepsake and Gem materials.
+Ebony Bracelet and Gold Bracelet can be farmed quite well in the 8th Floor of the run.
+
+5. Frequently Asked Questions (FAQ)
+Can i enter the Demon Tower with more than 2 Characters? - Yes, you can
+What is the Rarity Smith and what does he do? - The Rarity Smith, as the name suggests, is a Blacksmith that specifically upgrades Rarity Items below level 61. Any Item of the rank "Rare" or higher which is for max. Lv. 60 or lower can be upgraded here, as long as your Character is Level 80 or higher. Notes: The Item can't break, it can only downgrade the same way as if you were using a Blessing Scroll. On top of that you do not require any Upgrade Materials on this Blacksmith. Every character only gets 1 Upgrade attempt every Run.
+Is there anything I definitelly need in order to finish this Run? - If you only want to kill the "Death Reaper", no. If you want to do all 12 Floors you will require a Dragon Mage and a Polymorph Marble in order to kill the "Vile Elite Demon King" and the "Blue Death".
+Does the Demontower Blacksmith in the 6th Floor have increased success chance? - No, it doesn't.
+Can i use the Item "Summon Demon King" to get another blacksmith? - Yes, that is very much possible. Using this Item will kill the old Blacksmith and spawn a new one, once the new Demon King is defeated. Since it is a new Blacksmith, it will also allow you to upgrade again.

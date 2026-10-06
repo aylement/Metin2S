@@ -1,0 +1,147 @@
+//type	cx	cy	sx	sy	z	dir	time	percent	count	vnum
+//-----------------------------------------------------------------------------------
+// Floor 1: exactly one tight group of Vile Demons (strong), the rest plain Demons
+// (Archer/Soldier/Shaman). No Ghost of Grudge, no Brutal Demons, no boss on this floor.
+// type 'm' = direct monster spawn (type 'r' means "group collection", a different lookup
+// entirely, and silently spawns nothing when no such collection is seeded for these vnums).
+m	160	640	10	10	0	0	5s	100	2	1031
+m	165	645	10	10	0	0	5s	100	2	1032
+m	155	635	10	10	0	0	5s	100	1	1034
+m	170	650	10	10	0	0	5s	100	1	1037
+m	130	600	20	20	0	0	5s	100	3	1001
+m	140	610	20	20	0	0	5s	100	3	1002
+m	120	590	20	20	0	0	5s	100	2	1004
+m	200	660	20	20	0	0	5s	100	3	1001
+m	210	670	20	20	0	0	5s	100	3	1002
+m	190	690	20	20	0	0	5s	100	2	1004
+m	100	700	20	20	0	0	5s	100	2	1001
+m	110	710	20	20	0	0	5s	100	2	1002
+
+// Floor 2: local y 350-500 (world zone the C# floor-clear check watches - see MonsterEntity.cs's
+// FLOOR2_LOCAL_Y_MIN/MAX). Should teem with monsters - mostly plain Demons, plus several distinct
+// Vile Demon groups. Respawn time set very long (99999s) so the population is effectively finite -
+// this floor's whole point is "kill them all", it must not passively refill mid-fight.
+// Arranged as a RING around the landing point (175,425), not a filled disc - user confirmed there's a
+// wide pillar in the center of this room that would otherwise hide spawns behind it. Kept away from
+// the outer edges too (tightened in) since some earlier spawns landed behind unmapped walls (no real
+// collision data for this map - see the devil-tower notes in
+// docs/docs/Guides/monster-visibility-tuning.md - positions here are a guess, not verified geometry).
+m	210	425	15	15	0	0	99999s	100	2	1001
+m	205	445	15	15	0	0	99999s	100	2	1002
+m	190	460	15	15	0	0	99999s	100	2	1004
+m	160	460	15	15	0	0	99999s	100	2	1001
+m	145	445	15	15	0	0	99999s	100	2	1002
+m	140	425	15	15	0	0	99999s	100	2	1004
+m	145	405	15	15	0	0	99999s	100	2	1001
+m	160	390	15	15	0	0	99999s	100	2	1002
+m	190	390	15	15	0	0	99999s	100	2	1004
+m	205	405	15	15	0	0	99999s	100	2	1001
+m	220	435	15	15	0	0	99999s	100	2	1002
+m	130	435	15	15	0	0	99999s	100	2	1004
+m	185	470	15	15	0	0	99999s	100	2	1001
+m	165	470	15	15	0	0	99999s	100	2	1002
+m	185	380	15	15	0	0	99999s	100	2	1004
+m	165	380	15	15	0	0	99999s	100	2	1001
+// Vile Demon groups (tight clusters), spaced apart around the same ring
+m	220	390	8	8	0	0	99999s	100	1	1031
+m	225	395	8	8	0	0	99999s	100	1	1032
+m	220	400	8	8	0	0	99999s	100	1	1034
+m	225	405	8	8	0	0	99999s	100	1	1037
+m	125	455	8	8	0	0	99999s	100	1	1031
+m	130	460	8	8	0	0	99999s	100	1	1032
+m	125	465	8	8	0	0	99999s	100	1	1033
+m	175	475	8	8	0	0	99999s	100	1	1031
+m	180	480	8	8	0	0	99999s	100	1	1032
+m	175	485	8	8	0	0	99999s	100	1	1034
+m	180	470	8	8	0	0	99999s	100	1	1037
+
+// Floor 3: local x 10000-25000, y 10000-25000 (world zone the C# floor-clear check watches - see
+// MonsterEntity.cs's FLOOR3_LOCAL_*). Boss floor - a modest ring of plain Demons plus the Demon King
+// himself. Killing the Demon King (not clearing every Demon) is what advances to floor 4 - see
+// HandleDevilTowerFloorTrigger(). Same finite-population respawn convention as floor 2.
+m	210	175	15	15	0	0	99999s	100	2	1001
+m	200	195	15	15	0	0	99999s	100	2	1002
+m	175	205	15	15	0	0	99999s	100	2	1004
+m	150	195	15	15	0	0	99999s	100	2	1001
+m	140	175	15	15	0	0	99999s	100	2	1002
+m	150	155	15	15	0	0	99999s	100	2	1004
+m	175	145	15	15	0	0	99999s	100	2	1001
+m	200	155	15	15	0	0	99999s	100	2	1002
+// Demon King boss, slightly off-center
+m	175	200	20	20	0	0	99999s	100	1	1091
+
+// Floor 4: local x 35000-43500, y 61000-70500 - 10 identical level-60 Metins ("Metin des Sturzes"/Metin
+// of the Fall, vnum 8012) arranged in a ring around the landing point (393,658). One is secretly picked
+// at random on first death to advance to floor 5 (see DEVIL_TOWER_FLOOR4_METIN_VNUM in
+// MonsterEntity.cs) - the other 9 are just ordinary Metins, no special behaviour needed here.
+m	428	658	0	0	0	0	99999s	100	1	8012
+m	421	679	0	0	0	0	99999s	100	1	8012
+m	404	691	0	0	0	0	99999s	100	1	8012
+m	382	691	0	0	0	0	99999s	100	1	8012
+m	365	679	0	0	0	0	99999s	100	1	8012
+m	358	658	0	0	0	0	99999s	100	1	8012
+m	365	637	0	0	0	0	99999s	100	1	8012
+m	382	625	0	0	0	0	99999s	100	1	8012
+m	404	625	0	0	0	0	99999s	100	1	8012
+m	421	637	0	0	0	0	99999s	100	1	8012
+
+// Floor 5: local x 350-435, y 380-480 (world zone the C# floor-clear check watches - see
+// MonsterEntity.cs's FLOOR5_LOCAL_*). Real floor design is "kill monsters for Unlock Stones, break 5
+// Seals" over many waves across ~20 minutes - simplified to 2 "kill them all" waves at the user's
+// explicit request to start small. This is WAVE 1 ONLY (plain Demons, ring around the landing point
+// 393,430) - wave 2 (more Vile Demons) has no regen.txt trigger to hook and is spawned in code by
+// SpawnFloor5Wave2() once wave 1's last monster here dies.
+m	427	430	15	15	0	0	99999s	100	2	1001
+m	417	455	15	15	0	0	99999s	100	2	1002
+m	392	465	15	15	0	0	99999s	100	2	1004
+m	367	455	15	15	0	0	99999s	100	2	1001
+m	357	430	15	15	0	0	99999s	100	2	1002
+m	367	405	15	15	0	0	99999s	100	2	1004
+m	392	395	15	15	0	0	99999s	100	2	1001
+m	417	405	15	15	0	0	99999s	100	2	1002
+
+// Floor 6: local x 14000-43500, y 14000-24500 (regen 140-435, 140-245) - a much wider real zone than
+// floors 1-5 (see MonsterEntity.cs's FLOOR6_LOCAL_* comment). A full room of Demons plus the Proud
+// Demon King boss ("Stolzer Damonenkonig", vnum 1092, double the regular Demon King's HP). Unlike
+// floor 3, EVERYONE here (boss included) must die to advance - see HandleDevilTowerFloorTrigger().
+// Landing point (regen 392,192) is the same one floor 5's warp target already uses, confirmed walkable.
+m	427	192	15	15	0	0	99999s	100	2	1001
+m	417	217	15	15	0	0	99999s	100	2	1002
+m	392	227	15	15	0	0	99999s	100	2	1004
+m	367	217	15	15	0	0	99999s	100	2	1001
+m	357	192	15	15	0	0	99999s	100	2	1002
+m	367	167	15	15	0	0	99999s	100	2	1004
+m	392	157	15	15	0	0	99999s	100	2	1001
+m	417	167	15	15	0	0	99999s	100	2	1002
+// Vile Demon clusters
+m	410	205	8	8	0	0	99999s	100	1	1031
+m	410	210	8	8	0	0	99999s	100	1	1032
+m	410	215	8	8	0	0	99999s	100	1	1034
+m	410	220	8	8	0	0	99999s	100	1	1037
+m	375	180	8	8	0	0	99999s	100	1	1031
+m	375	185	8	8	0	0	99999s	100	1	1032
+m	375	190	8	8	0	0	99999s	100	1	1034
+m	375	195	8	8	0	0	99999s	100	1	1037
+// Proud Demon King boss, slightly off from the landing point
+m	405	178	10	10	0	0	99999s	100	1	1092
+
+// Floor 7: local x 56000-68000, y 60000-73000 (regen 560-680, 600-730) - a NEW part of the map,
+// distinct from floors 1-6's x 10000-43500 (see __GetDevilTowerFloor()). New monster tier not used on
+// earlier floors: Ghost of Grudge (1035), Ghost of Chaos (1036), Skull Swordmaster (1038), Flying
+// Skull (1039), level 71-74 - plus a couple Vile Demon Leader (1037) clusters for density. Landing
+// point (regen 620,665) is an UNVERIFIED guess (center-ish of the real zone) - same caveat as every
+// hand-placed position here, see Known limitations in docs/docs/Guides/devil-tower-content.md.
+m	655	665	15	15	0	0	99999s	100	2	1035
+m	645	690	15	15	0	0	99999s	100	2	1036
+m	620	700	15	15	0	0	99999s	100	2	1038
+m	595	690	15	15	0	0	99999s	100	2	1039
+m	585	665	15	15	0	0	99999s	100	2	1035
+m	595	640	15	15	0	0	99999s	100	2	1036
+m	620	630	15	15	0	0	99999s	100	2	1038
+m	645	640	15	15	0	0	99999s	100	2	1039
+// Vile Demon Leader clusters
+m	635	650	8	8	0	0	99999s	100	1	1037
+m	605	680	8	8	0	0	99999s	100	1	1037
+// Level 70 Metin ("Metin des Mordes"/Metin of Murder) - breaking it advances to floor 8, see
+// DEVIL_TOWER_FLOOR7_METIN_VNUM in MonsterEntity.cs.
+m	640	680	0	0	0	0	99999s	100	1	8014

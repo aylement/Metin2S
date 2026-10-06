@@ -11,6 +11,7 @@ using QuantumCore.API.Game.World;
 using QuantumCore.API.PluginTypes;
 using QuantumCore.Core.Utils;
 using QuantumCore.Game.Services;
+using QuantumCore.Game.World.Entities;
 
 namespace QuantumCore.Game.World;
 
@@ -103,6 +104,32 @@ public class World : IWorld
         }
 
         LoadShops();
+        RegisterDevilTowerGuard();
+    }
+
+    // Same world-scoped registration pattern as LoadShops (playerVid: null - registered once at load
+    // time, must never be swept by GameEventManager.UnregisterPlayer's per-player cleanup). Vnum 11000
+    // ("City Guard"/Wächter des Dorfplatzes skin) is reused as-is for this NPC's model rather than a
+    // dedicated vnum - the display name shown in-game is therefore whatever that proto's own name is,
+    // not literally "Demon Tower Guard" (this server has no per-spawn name override, only per-vnum
+    // proto data). The map+position condition below scopes the warp behaviour to just THIS one guard
+    // (placed on metin2_map_milgyo at 528,593 in npc.txt) rather than hijacking every City Guard vnum
+    // 11000 that might exist elsewhere.
+    private const uint DEVIL_TOWER_GUARD_NPC_VNUM = 11000;
+    private const string DEVIL_TOWER_GUARD_MAP_NAME = "metin2_map_milgyo";
+
+    private static void RegisterDevilTowerGuard()
+    {
+        GameEventManager.RegisterNpcClickEvent("Demon Tower Guard", DEVIL_TOWER_GUARD_NPC_VNUM, null,
+            player =>
+            {
+                // Same landing spot /goto -m deviltower1 uses (this map's Town.txt), reached directly
+                // rather than duplicating GotoCommand's map-lookup/walkable-nudge logic for one fixed
+                // destination.
+                ((PlayerEntity) player).WarpTo(new Coordinates(216300, 726800));
+                return Task.CompletedTask;
+            },
+            player => player.Map?.Name == DEVIL_TOWER_GUARD_MAP_NAME);
     }
 
     private void LoadShops()
@@ -306,8 +333,9 @@ public class World : IWorld
         if (e is IPlayerEntity player)
         {
             AddPlayer(player);
-            _logger.LogInformation("Player {PlayerName} ({PlayerId}) joined the map {MapName}", player.Name,
-                player.Vid, map.Name);
+            _logger.LogInformation(
+                "Player {PlayerName} ({PlayerId}) joined the map {MapName} on connection {ConnectionId}",
+                player.Name, player.Vid, map.Name, player.Connection.Id);
         }
 
 #pragma warning disable VSTHRD002 // use await - TODO

@@ -1,0 +1,18 @@
+//type	cx	cy	sx	sy	z	dir	time	percent	count	vnum
+//-----------------------------------------------------------------------------------
+// Hwang/Dark Temple (metin2_map_milgyo). The client's own regen.txt for this map ships empty
+// (dynamic/quest-driven like the tower), so these are hand-placed, clustered near the landing
+// point (150,150). Tree Frog family per user confirmation: 1302 Tree Frog Leader, 1331 Big
+// Tree Frog Soldier, 1332 Big Tree Frog Leader (real vnums, verified against the official
+// mob_proto.csv).
+m	140	140	15	15	0	0	5s	100	3	1302
+m	160	150	15	15	0	0	5s	100	3	1302
+m	150	170	15	15	0	0	5s	100	2	1331
+m	170	180	15	15	0	0	5s	100	2	1331
+m	130	160	15	15	0	0	20s	100	1	1332
+m	180	140	20	20	0	0	5s	100	2	1302
+m	120	180	20	20	0	0	5s	100	2	1302
+m	200	160	20	20	0	0	5s	100	2	1331
+
+// Dark Leader boss (vnum 791), placed at the user's live position.
+m	802	848	0	0	0	0	5s	100	1	791

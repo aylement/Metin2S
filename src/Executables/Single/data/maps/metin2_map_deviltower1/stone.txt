@@ -1,0 +1,6 @@
+//type	cx	cy	sx	sy	z	dir	time	percent	count	vnum
+//-----------------------------------------------------------------------------------
+// Metin of Toughness (Metin der Härte in the real client's German locale), vnum 8010, level 50,
+// confirmed via the real server's plaintext mob_proto.txt/mob_proto.csv (matches "metin de force
+// lvl 50" - real game classifies it under the STRENGTH-attribute metin family).
+m	203	683	0	0	0	0	30m	100	1	8010

@@ -39,6 +39,15 @@ public class SimpleBehaviour : IBehaviour
 
     public bool IsAggressive { get; set; }
 
+    // Devil Tower floor 7's explicit special-case mechanic (user's request): monsters spawned there stay
+    // aggressive toward a player for as long as that player is within view/minimap range (Entity.
+    // VIEW_DISTANCE), not just the normal small GIVE_UP_DISTANCE - and re-acquire the nearest player
+    // immediately once one comes into range, rather than only reacting to OnNewNearbyEntity. Computed
+    // once from spawn position (these mobs wander at most 300-700 units, well inside the floor's zone),
+    // same narrow-special-case pattern as MonsterEntity's other Devil Tower floor logic - not a general
+    // AI feature.
+    private bool _alwaysAggroWithinViewRange;
+
     // mob idle wander
     private const int MOVE_MIN_DISTANCE = 300;
     private const int MOVE_MAX_DISTANCE = 700;
@@ -73,6 +82,20 @@ public class SimpleBehaviour : IBehaviour
         IsAggressive = entity is MonsterEntity mob && mob.Proto.AiFlag.HasAnyFlags(EAiFlags.AGGRESSIVE);
         _lastAttackTime = null;
         _lastChangeAttackPositionTime = null;
+
+        if (entity.Map is { Name: MonsterEntity.DEVIL_TOWER_MAP_NAME } map)
+        {
+            var localX = _spawnX - (int)map.Position.X;
+            var localY = _spawnY - (int)map.Position.Y;
+            _alwaysAggroWithinViewRange = localX >= MonsterEntity.FLOOR7_LOCAL_X_MIN &&
+                                           localX <= MonsterEntity.FLOOR7_LOCAL_X_MAX &&
+                                           localY >= MonsterEntity.FLOOR7_LOCAL_Y_MIN &&
+                                           localY <= MonsterEntity.FLOOR7_LOCAL_Y_MAX;
+            if (_alwaysAggroWithinViewRange)
+            {
+                IsAggressive = true;
+            }
+        }
     }
 
     private void CalculateNextMovement()
@@ -149,17 +172,28 @@ public class SimpleBehaviour : IBehaviour
             return;
         }
 
+        if (Target is null && _alwaysAggroWithinViewRange)
+        {
+            Target = FindNearestPlayerInRange();
+        }
+
         if (Target is not null)
         {
             var targetLost = Target.Dead || Target.Map != _entity.Map;
 
-            if (!targetLost && GIVE_UP_DISTANCE <= MathUtils.Distance(_entity.PositionX, _entity.PositionY,
+            // Floor 7's mobs give up only once the player leaves view/minimap range entirely
+            // (Entity.VIEW_DISTANCE), not the small normal chase-give-up distance.
+            var giveUpDistance = _alwaysAggroWithinViewRange ? Entity.VIEW_DISTANCE : GIVE_UP_DISTANCE;
+            if (!targetLost && giveUpDistance <= MathUtils.Distance(_entity.PositionX, _entity.PositionY,
                     Target.PositionX, Target.PositionY))
             {
                 targetLost = true;
             }
 
-            if (!targetLost && _lastAttackTime.HasValue)
+            // The "haven't landed a hit in a while and wandered off from the last attack spot" give-up
+            // path doesn't apply to floor 7's permanent-aggro mobs - they should just keep chasing for
+            // as long as the target stays in range, see the VIEW_DISTANCE check above instead.
+            if (!_alwaysAggroWithinViewRange && !targetLost && _lastAttackTime.HasValue)
             {
                 if (ctx.ElapsedSince(_lastAttackTime.Value) > TimeSpan.FromMilliseconds(RETURN_TIMEOUT_MS))
                 {
@@ -182,9 +216,11 @@ public class SimpleBehaviour : IBehaviour
             if (targetLost)
             {
                 // TODO: (but not here) restore aggro if mob is from metin stone and stone is attacked again
-                // Switch to next target if available
+                // Switch to next target if available - floor 7's permanent-aggro mobs re-acquire the
+                // nearest in-range player directly instead of ranking by damage dealt so far, since the
+                // whole point here is "always hostile to whoever is close", not a threat table.
                 _damageMap.Remove(Target.Vid);
-                Target = NextTarget();
+                Target = _alwaysAggroWithinViewRange ? FindNearestPlayerInRange() : NextTarget();
 
                 if (Target is null)
                 {
@@ -385,6 +421,31 @@ public class SimpleBehaviour : IBehaviour
                 player.Connection.Send(packet);
             }
         }
+    }
+
+    // Floor 7's permanent-aggro mobs only: picks the closest player currently within view/minimap range
+    // (Entity.NearbyEntities is already bounded to Entity.VIEW_DISTANCE), ignoring the damage-based
+    // threat table NextTarget() uses - "always hostile to whoever is close" is the whole point here.
+    private IEntity? FindNearestPlayerInRange()
+    {
+        if (_entity is null) return null;
+
+        IEntity? nearest = null;
+        var nearestDistance = double.MaxValue;
+        foreach (var candidate in _entity.NearbyEntities)
+        {
+            if (candidate is not IPlayerEntity || candidate.Dead) continue;
+
+            var distance = MathUtils.Distance(_entity.PositionX, _entity.PositionY, candidate.PositionX,
+                candidate.PositionY);
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearest = candidate;
+            }
+        }
+
+        return nearest;
     }
 
     private IEntity? NextTarget()
