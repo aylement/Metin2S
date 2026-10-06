@@ -50,7 +50,6 @@ public class SimpleBehaviour : IBehaviour
     private const double GIVE_UP_DISTANCE = 4000; // stop chase if target >40m away
 
     private const long CHANGE_ATTACK_POSITION_TIME_NEAR_MS = 10000;
-    private const long CHANGE_ATTACK_POSITION_TIME_FAR_MS = 1000;
     private const double CHANGE_ATTACK_POSITION_DISTANCE = 100;
 
     private const double PREFERRED_ATTACK_RANGE_PERCENTAGE_RANGED = 0.8;
@@ -318,16 +317,19 @@ public class SimpleBehaviour : IBehaviour
             return true;
         }
 
-        TimeSpan changeInterval;
+        // Only flank/circle once actually close to the target. While still chasing from far
+        // away, let MoveTo()'s direct approach run uninterrupted - re-rolling a random nearby
+        // point every second here caused monsters to zigzag toward essentially-random points
+        // for the whole chase instead of beelining in, which is what produced the large
+        // client-visible position desync (and "attacking while still visibly approaching")
+        // reported for melee mobs. Target-moved-out-of-range recompute is already handled
+        // separately (see the MOVING-branch check in Update()), so this is safe to skip here.
         if (currentDistance > CHANGE_ATTACK_POSITION_DISTANCE + mob.Proto.AttackRange)
         {
-            changeInterval = TimeSpan.FromMilliseconds(CHANGE_ATTACK_POSITION_TIME_FAR_MS);
-        }
-        else
-        {
-            changeInterval = TimeSpan.FromMilliseconds(CHANGE_ATTACK_POSITION_TIME_NEAR_MS);
+            return false;
         }
 
+        var changeInterval = TimeSpan.FromMilliseconds(CHANGE_ATTACK_POSITION_TIME_NEAR_MS);
         return ctx.ElapsedSince(_lastChangeAttackPositionTime) > changeInterval;
     }
 
@@ -412,7 +414,16 @@ public class SimpleBehaviour : IBehaviour
         ArgumentNullException.ThrowIfNull(attacker);
         if (_entity is null) return;
 
-        _lastAttackTime = (_entity.Map as Map)!.Clock.Now;
+        // The monster can already have been despawned (Map.cs sets Entity.Map = null as part of its
+        // pending-removal cleanup, e.g. on death) by the time this runs, if a second/queued attack
+        // packet against the same target is processed right after the killing blow - a real crash
+        // (NullReferenceException, closing the player's connection) confirmed live while fighting a
+        // metin stone surrounded by several mobs, from the old unconditional `(_entity.Map as Map)!`.
+        // The entity is already gone from the world at that point, so there's nothing meaningful left
+        // to update here.
+        if (_entity.Map is not Map map) return;
+
+        _lastAttackTime = map.Clock.Now;
         _lastAttackX = _entity.PositionX;
         _lastAttackY = _entity.PositionY;
 

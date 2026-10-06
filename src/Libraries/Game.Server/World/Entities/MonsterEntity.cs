@@ -219,6 +219,20 @@ public class MonsterEntity : Entity
                 return Proto.Experience;
             case EPoint.MAX_HP:
                 return Proto.Hp;
+            // Player-only bonus/resist stats (gear, skills) that monsters simply don't have - correctly 0,
+            // not "unimplemented". These used to fall through to the LogWarning below, called on every
+            // single combat calculation involving a monster (attacker or defender) - with several monsters
+            // actively fighting, that's many warnings PER TICK, each a real (if individually small) log
+            // I/O cost, and live-confirmed as the actual cause of severe tick delay (up to ~10s) once
+            // there was enough simultaneous combat to make the flood add up - not a coincidence tied to any
+            // particular content, just never having had enough concurrent monster combat before to notice.
+            case EPoint.ATTACK_BONUS:
+            case EPoint.MAGIC_ATTACK_BONUS:
+            case EPoint.CRITICAL_PERCENTAGE:
+            case EPoint.PENETRATE_PERCENTAGE:
+            case EPoint.RESIST_CRITICAL:
+            case EPoint.RESIST_PENETRATE:
+                return 0;
         }
 
         _logger.LogWarning("Point {Point} is not implemented on monster", point);
