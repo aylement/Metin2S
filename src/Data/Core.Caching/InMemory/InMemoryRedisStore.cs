@@ -138,8 +138,22 @@ public class InMemoryRedisStore : IRedisStore
 
     public ValueTask<long> PersistAsync(string key)
     {
-        // TODO implement persistence
-        return ValueTask.FromResult(1L);
+        // Mirrors ExpireAsync's pattern in reverse: clear the TTL so the key survives indefinitely,
+        // like real Redis's PERSIST command. This was a no-op stub before, which silently broke
+        // TokenLoginHandler's "remove TTL so the auth token survives further game core transitions"
+        // step (see its own comment) for anyone running the in-memory store (Single/dev mode) - the
+        // token kept its original 30-second TTL from LoginRequestHandler, so any warp chain taking
+        // longer than 30s total (e.g. multi-hop map transitions like Devil Tower's access map relay)
+        // hit "Received invalid auth token" and got disconnected. Confirmed live: deviltower1 ->
+        // milgyo -> deviltower1's actual entrance, ~45s total, failed on the 3rd hop.
+        if (_dict.TryGetValue(key, out var tuple) && tuple.Expiry is not null)
+        {
+            tuple.Expiry = null;
+            _dict[key] = tuple;
+            return ValueTask.FromResult(1L);
+        }
+
+        return ValueTask.FromResult(0L);
     }
 
     public ValueTask<string> FlushAllAsync()
