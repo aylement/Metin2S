@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Security.Cryptography;
 using EnumsNET;
 using Microsoft.Extensions.Logging;
@@ -9,6 +10,7 @@ using QuantumCore.API.Game.Types;
 using QuantumCore.API.Game.Types.Entities;
 using QuantumCore.API.Game.Types.Monsters;
 using QuantumCore.API.Game.World;
+using QuantumCore.API.Packets;
 using QuantumCore.Core.Event;
 using QuantumCore.Core.Utils;
 using QuantumCore.Game.Extensions;
@@ -36,6 +38,16 @@ public class Map : IMap
 
     public IWorld World => _world;
     public IReadOnlyCollection<IEntity> Entities => _entities;
+
+    /// <summary>
+    /// Distinct monster/NPC race ids this map can ever spawn, resolved once at <see cref="InitializeAsync"/>
+    /// time from <see cref="_spawnPoints"/> (including GROUP/GROUP_COLLECTION entries, mirroring the
+    /// resolution <see cref="SpawnGroup(MonsterGroup)"/> does at actual spawn time). Sent to each player as
+    /// they enter this map (see the pending-spawn loop in <see cref="Update"/>) via
+    /// <see cref="ZoneMonsterPrecache"/> so the client can start background-loading those races' resources
+    /// before it actually needs to render one - see that packet's own doc comment for why.
+    /// </summary>
+    public ImmutableArray<uint> KnownMonsterRaceIds { get; private set; } = ImmutableArray<uint>.Empty;
 
     private readonly List<IEntity> _entities = new();
     private readonly QuadTree _quadTree;
@@ -121,11 +133,69 @@ public class Map : IMap
 
         _logger.LogDebug("Loaded {SpawnPointsCount} spawn points for map {MapName}", _spawnPoints.Count, Name);
 
+        ComputeKnownMonsterRaceIds();
+
         // Populate map
         foreach (var spawnPoint in _spawnPoints)
         {
             var monsterGroup = new MonsterGroup { SpawnPoint = spawnPoint };
             SpawnGroup(monsterGroup);
+        }
+    }
+
+    /// <summary>
+    /// Resolves <see cref="KnownMonsterRaceIds"/> from <see cref="_spawnPoints"/> - deliberately reading
+    /// the spawn point *definitions* rather than the live <see cref="_entities"/> list, because at the
+    /// point this runs (end of <see cref="InitializeAsync"/>) nothing has actually been spawned yet:
+    /// <see cref="SpawnEntity"/> only enqueues to <see cref="_pendingSpawns"/>, drained later by the first
+    /// <see cref="Update"/> tick.
+    /// </summary>
+    private void ComputeKnownMonsterRaceIds()
+    {
+        var raceIds = new HashSet<uint>();
+
+        foreach (var spawnPoint in _spawnPoints)
+        {
+            switch (spawnPoint.Type)
+            {
+                case ESpawnPointType.MONSTER:
+                    raceIds.Add(spawnPoint.Monster);
+                    break;
+
+                case ESpawnPointType.GROUP:
+                    AddGroupRaceIds(spawnPoint.Monster, raceIds);
+                    break;
+
+                case ESpawnPointType.GROUP_COLLECTION:
+                    var groupCollection = _world.GetGroupCollection(spawnPoint.Monster);
+                    if (groupCollection is not null)
+                    {
+                        foreach (var collectionGroup in groupCollection.Groups)
+                        {
+                            AddGroupRaceIds(collectionGroup.Id, raceIds);
+                        }
+                    }
+
+                    break;
+
+                // EXCEPTION/SPECIAL spawn points aren't resolved by SpawnGroup() either (see the switch
+                // in SpawnGroup(MonsterGroup) above) - nothing to add here.
+            }
+        }
+
+        KnownMonsterRaceIds = raceIds.ToImmutableArray();
+    }
+
+    private void AddGroupRaceIds(uint groupId, HashSet<uint> raceIds)
+    {
+        var group = _world.GetGroup(groupId);
+        if (group is null) return;
+
+        raceIds.Add(group.Leader);
+
+        foreach (var member in group.Members)
+        {
+            raceIds.Add(member.Id);
         }
     }
 
@@ -160,6 +230,17 @@ public class Map : IMap
 
             _entities.Add(entity);
             entity.Map = this;
+
+            // Hint the client to start background-loading this map's monster/NPC resources before it
+            // actually runs into one - see ZoneMonsterPrecache's doc comment for the full "why". Fire on
+            // arrival regardless of whether this is the player's first ever spawn or a warp back into a
+            // map they've already visited: the client's own cache (see CResourceManager) may since have
+            // evicted what it loaded last time, and this packet is cheap/idempotent to just resend.
+            if (entity.Type == EEntityType.PLAYER && entity is IPlayerEntity player &&
+                KnownMonsterRaceIds.Length > 0)
+            {
+                player.Connection.Send(new ZoneMonsterPrecache { RaceIds = KnownMonsterRaceIds.ToArray() });
+            }
         }
 
         while (_pendingRemovals.TryDequeue(out var entity))
